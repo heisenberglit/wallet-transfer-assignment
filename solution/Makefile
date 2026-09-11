@@ -1,4 +1,4 @@
-.PHONY: run test lint fmt migrate-up migrate-down up down
+.PHONY: run test test-integration lint fmt migrate-up migrate-down seed up down
 
 run:
 	go run ./cmd/server
@@ -19,7 +19,13 @@ down:
 	docker compose down
 
 migrate-up:
-	psql "$$DATABASE_URL" -f migrations/0001_init.up.sql
+	docker compose exec -T postgres psql -U postgres -d wallet_transfer -v ON_ERROR_STOP=1 -f - < migrations/0001_init.up.sql
 
 migrate-down:
-	psql "$$DATABASE_URL" -f migrations/0001_init.down.sql
+	docker compose exec -T postgres psql -U postgres -d wallet_transfer -v ON_ERROR_STOP=1 -f - < migrations/0001_init.down.sql
+
+seed:
+	docker compose exec -T postgres psql -U postgres -d wallet_transfer -v ON_ERROR_STOP=1 -f - < scripts/seed.sql
+
+test-integration:
+	DATABASE_URL="postgres://postgres:postgres@localhost:5432/wallet_transfer?sslmode=disable" go test ./... -cover
