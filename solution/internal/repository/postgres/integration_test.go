@@ -246,3 +246,52 @@ func TestTransferExecutor_Execute_ConcurrentDebits(t *testing.T) {
 	require.NoError(t, err)
 	assert.EqualValues(t, succeeded*perTransfer, toWallet.Balance)
 }
+
+func TestTransferExecutor_Execute_OppositeDirectionDeadlock(t *testing.T) {
+	pool := testPool(t)
+	const (
+		startingBalance = 10000
+		perTransfer     = 10
+		perSide         = 30
+	)
+	walletA, walletB := seedWallets(t, pool, startingBalance, startingBalance)
+	transfers := postgres.NewTransferRepository(pool)
+	wallets := postgres.NewWalletRepository(pool)
+	executor := postgres.NewTransferExecutor(pool)
+	ctx := context.Background()
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+
+	fire := func(from, to string) {
+		defer wg.Done()
+		transfer := newPendingTransfer(from, to, perTransfer)
+		if err := transfers.Create(ctx, transfer); err != nil {
+			t.Errorf("transfers.Create: %v", err)
+			return
+		}
+		debit := domain.LedgerEntry{ID: uuid.NewString(), WalletID: from, TransferID: transfer.ID, Type: domain.LedgerDebit, Amount: perTransfer, CreatedAt: time.Now()}
+		credit := domain.LedgerEntry{ID: uuid.NewString(), WalletID: to, TransferID: transfer.ID, Type: domain.LedgerCredit, Amount: perTransfer, CreatedAt: time.Now()}
+
+		<-start
+		if err := executor.Execute(ctx, transfer, debit, credit); err != nil {
+			t.Errorf("executor.Execute (from=%s to=%s): %v", from, to, err)
+		}
+	}
+
+	for i := 0; i < perSide; i++ {
+		wg.Add(2)
+		go fire(walletA, walletB)
+		go fire(walletB, walletA)
+	}
+	close(start)
+	wg.Wait()
+
+	balA, err := wallets.Get(ctx, walletA)
+	require.NoError(t, err)
+	balB, err := wallets.Get(ctx, walletB)
+	require.NoError(t, err)
+
+	assert.EqualValues(t, startingBalance, balA.Balance)
+	assert.EqualValues(t, startingBalance, balB.Balance)
+}

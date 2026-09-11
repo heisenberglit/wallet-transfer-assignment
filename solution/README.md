@@ -60,8 +60,34 @@ WHERE id = $2 AND balance >= $1
 Postgres takes the row lock as part of the `UPDATE` itself, so the
 balance check and the decrement happen atomically — no separate
 `SELECT ... FOR UPDATE`, no window for a concurrent transfer to read a
-stale balance, and no explicit lock-ordering rule needed to avoid
-deadlocking against a transfer moving funds the other way.
+stale balance. Mechanically, this relies on EvalPlanQual: when the
+`UPDATE` hits a row a concurrent transaction is modifying, it waits, then
+re-evaluates `WHERE balance >= $1` against the new row version once that
+transaction commits — under this transaction's default READ COMMITTED
+isolation. (At REPEATABLE READ the same statement would raise a
+serialization failure, SQLSTATE 40001, instead of quietly returning 0
+rows — worth knowing if the isolation level ever changes.)
+
+**This does *not* mean no lock-ordering rule is needed** — an earlier
+version of this README claimed that, and it was wrong. An `UPDATE` holds
+its row lock until commit exactly like `SELECT ... FOR UPDATE` would: a
+transfer A→B locks A then wants B, while a concurrent transfer B→A locks
+B then wants A — a real deadlock cycle, reproduced against a live
+Postgres (`SQLSTATE 40P01`) before this was fixed. `Execute` now runs the
+two wallet `UPDATE`s in ascending wallet-id order regardless of transfer
+direction, which breaks the cycle: both directions now contend for the
+same wallet first instead of forming a circular wait.
+`TestTransferExecutor_Execute_OppositeDirectionDeadlock` fires transfers
+concurrently in both directions between the same two wallets and would
+fail (with that exact SQLSTATE) if this regressed.
+
+Two more things `Execute` guards against, both cheap and worth having:
+the transfer's state transition is a compare-and-swap
+(`WHERE state = 'PENDING'`), not an unconditional write, so a second call
+against an already-`PROCESSED` transfer fails loudly instead of
+re-applying the debit/credit; and the debit/credit amounts passed in are
+checked against `transfer.Amount` before any write, so a caller bug can't
+silently write a ledger entry that doesn't match what was actually moved.
 
 ## API
 
@@ -203,10 +229,16 @@ than the manual `psql` invocation above.
 
 **Conditional `UPDATE` instead of `SELECT ... FOR UPDATE` + application
 check.**
-✅ Simpler: one statement instead of read-then-decide-then-write; no
-explicit lock-ordering rule needed for two wallets.
-✅ Correct under concurrency by construction — verified by the
-`TestTransferExecutor_Execute_ConcurrentDebits` test.
+✅ Simpler within a single transfer: one statement instead of
+read-then-decide-then-write.
+✅ Correct under same-direction concurrency by construction — verified by
+`TestTransferExecutor_Execute_ConcurrentDebits`.
+❌ Still needs an explicit lock-ordering rule across the *two* wallets a
+transfer touches — an `UPDATE` holds its row lock until commit exactly
+like `SELECT ... FOR UPDATE` would, so this doesn't avoid the
+opposite-direction deadlock the way an earlier version of this doc
+claimed. See the write-path section above and
+`TestTransferExecutor_Execute_OppositeDirectionDeadlock`.
 ❌ The insufficient-funds check is now inside the SQL `WHERE` clause
 rather than visible as service-layer business logic — a reviewer looking
 only at `internal/service` wouldn't find it there.
@@ -258,3 +290,15 @@ reconciles them against each other.
   just `{"error": "insufficient funds"}` with 422, even though the
   `FAILED` transfer row does exist. Revisit if a client needs to look up
   a failed attempt later.
+- **No DB-level unique constraint on `ledger_entries (transfer_id, wallet_id)`.**
+  The application-level guards (the transfer-state CAS in
+  `TransferExecutor.Execute`, plus the fact that nothing currently calls
+  `Execute` twice for the same transfer) should prevent a duplicate pair
+  of ledger rows today, but there's no constraint enforcing it at the
+  database level as a second line of defense.
+- **Ledger `amount` is unsigned; direction comes from `type` (DEBIT/CREDIT)
+  alone**, and `now()` in the migrations' `updated_at` columns is
+  transaction-start time (`transaction_timestamp()`), not per-statement
+  time (`clock_timestamp()`) — both deliberate for this schema's scope,
+  but worth a second look if requirements around signed ledger amounts or
+  sub-transaction timestamp precision ever show up.
