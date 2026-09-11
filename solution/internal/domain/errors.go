@@ -2,11 +2,10 @@ package domain
 
 import "errors"
 
-// Sentinel domain errors. Handlers map these to HTTP status codes;
-// services and repositories should return these (or wrap them) instead of
-// leaking persistence-specific errors across layers.
+// Sentinel domain errors; handlers map these to HTTP status codes.
 var (
 	ErrWalletNotFound      = errors.New("wallet not found")
+	ErrTransferNotFound    = errors.New("transfer not found")
 	ErrInsufficientFunds   = errors.New("insufficient funds")
 	ErrInvalidAmount       = errors.New("amount must be positive")
 	ErrSameWallet          = errors.New("fromWalletId and toWalletId must differ")

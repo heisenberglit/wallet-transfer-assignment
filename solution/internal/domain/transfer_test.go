@@ -8,8 +8,7 @@ import (
 	"github.com/heisenberglit/wallet-transfer-assignment/internal/domain"
 )
 
-// TODO: replace with real behavioral tests once the transfer state
-// machine and validation rules are implemented (see internal/service).
+// Behavioral tests for the state machine live in internal/service.
 func TestTransferStates(t *testing.T) {
 	assert.Equal(t, domain.TransferState("PENDING"), domain.TransferPending)
 	assert.Equal(t, domain.TransferState("PROCESSED"), domain.TransferProcessed)

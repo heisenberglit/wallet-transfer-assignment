@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/heisenberglit/wallet-transfer-assignment/internal/domain"
@@ -19,19 +20,30 @@ func NewWalletRepository(pool *pgxpool.Pool) *WalletRepository {
 }
 
 func (r *WalletRepository) Get(ctx context.Context, id string) (*domain.Wallet, error) {
-	// TODO: SELECT id, balance, created_at, updated_at FROM wallets WHERE id = $1
-	return nil, errors.New("not implemented")
+	const query = `SELECT id, balance, created_at, updated_at FROM wallets WHERE id = $1`
+	return scanWallet(r.pool.QueryRow(ctx, query, id))
 }
 
-// GetForUpdate reads the wallet row with a row-level lock so concurrent
-// transfers touching the same wallet serialize instead of racing.
-// TODO: SELECT ... FROM wallets WHERE id = $1 FOR UPDATE, run inside the
-// same transaction as the balance update in UpdateBalance.
+// GetForUpdate row-locks the wallet; only holds inside an explicit
+// transaction. Not used by TransferExecutor — kept for future read-then-decide flows.
 func (r *WalletRepository) GetForUpdate(ctx context.Context, id string) (*domain.Wallet, error) {
-	return nil, errors.New("not implemented")
+	const query = `SELECT id, balance, created_at, updated_at FROM wallets WHERE id = $1 FOR UPDATE`
+	return scanWallet(r.pool.QueryRow(ctx, query, id))
+}
+
+func scanWallet(row pgx.Row) (*domain.Wallet, error) {
+	var wallet domain.Wallet
+	if err := row.Scan(&wallet.ID, &wallet.Balance, &wallet.CreatedAt, &wallet.UpdatedAt); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, domain.ErrWalletNotFound
+		}
+		return nil, err
+	}
+	return &wallet, nil
 }
 
 func (r *WalletRepository) UpdateBalance(ctx context.Context, id string, newBalance int64) error {
-	// TODO: UPDATE wallets SET balance = $2, updated_at = now() WHERE id = $1
-	return errors.New("not implemented")
+	const query = `UPDATE wallets SET balance = $2, updated_at = now() WHERE id = $1`
+	_, err := r.pool.Exec(ctx, query, id, newBalance)
+	return err
 }

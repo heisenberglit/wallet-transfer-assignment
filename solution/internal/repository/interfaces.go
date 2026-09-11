@@ -7,10 +7,6 @@ import (
 )
 
 // WalletRepository handles persistence for wallets.
-//
-// TODO: decide whether GetForUpdate takes an explicit row lock (SELECT ...
-// FOR UPDATE) or whether concurrency is handled via optimistic locking on
-// an UpdateBalance version column. Document the choice in docs/design.md.
 type WalletRepository interface {
 	Get(ctx context.Context, id string) (*domain.Wallet, error)
 	GetForUpdate(ctx context.Context, id string) (*domain.Wallet, error)
@@ -31,11 +27,8 @@ type LedgerRepository interface {
 	ListForWallet(ctx context.Context, walletID string) ([]domain.LedgerEntry, error)
 }
 
-// UnitOfWork wraps a set of repository operations in a single atomic
-// transaction so the service layer can compose them without knowing about
-// the underlying database driver.
-//
-// TODO: implement in internal/repository/postgres using pgx.Tx.
-type UnitOfWork interface {
-	WithinTransaction(ctx context.Context, fn func(ctx context.Context) error) error
+// TransferExecutor atomically debits, credits, writes the ledger
+// entries, and marks the transfer PROCESSED.
+type TransferExecutor interface {
+	Execute(ctx context.Context, transfer *domain.Transfer, debit, credit domain.LedgerEntry) error
 }
