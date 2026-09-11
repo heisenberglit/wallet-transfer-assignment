@@ -4,16 +4,18 @@ import (
 	"context"
 	"errors"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/heisenberglit/wallet-transfer-assignment/internal/domain"
 )
 
 // LedgerRepository is the pgx-backed implementation of repository.LedgerRepository.
 type LedgerRepository struct {
-	db DBTX
+	pool *pgxpool.Pool
 }
 
-func NewLedgerRepository(db DBTX) *LedgerRepository {
-	return &LedgerRepository{db: db}
+func NewLedgerRepository(pool *pgxpool.Pool) *LedgerRepository {
+	return &LedgerRepository{pool: pool}
 }
 
 // CreateEntries inserts the DEBIT and CREDIT rows for a transfer.

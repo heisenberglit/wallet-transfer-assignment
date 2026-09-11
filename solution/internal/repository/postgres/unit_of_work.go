@@ -1,6 +1,10 @@
 package postgres
 
-import "context"
+import (
+	"context"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+)
 
 // UnitOfWork implements repository.UnitOfWork using a pgx transaction.
 //
@@ -9,10 +13,10 @@ import "context"
 // docs/design.md's concurrency strategy) and wire repositories to use the
 // tx from ctx when one is present instead of the bare pool.
 type UnitOfWork struct {
-	pool Beginner
+	pool *pgxpool.Pool
 }
 
-func NewUnitOfWork(pool Beginner) *UnitOfWork {
+func NewUnitOfWork(pool *pgxpool.Pool) *UnitOfWork {
 	return &UnitOfWork{pool: pool}
 }
 

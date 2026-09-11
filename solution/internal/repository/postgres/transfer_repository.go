@@ -4,16 +4,18 @@ import (
 	"context"
 	"errors"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/heisenberglit/wallet-transfer-assignment/internal/domain"
 )
 
 // TransferRepository is the pgx-backed implementation of repository.TransferRepository.
 type TransferRepository struct {
-	db DBTX
+	pool *pgxpool.Pool
 }
 
-func NewTransferRepository(db DBTX) *TransferRepository {
-	return &TransferRepository{db: db}
+func NewTransferRepository(pool *pgxpool.Pool) *TransferRepository {
+	return &TransferRepository{pool: pool}
 }
 
 func (r *TransferRepository) Create(ctx context.Context, t *domain.Transfer) error {

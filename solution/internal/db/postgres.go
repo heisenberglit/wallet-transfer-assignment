@@ -2,30 +2,31 @@ package db
 
 import (
 	"context"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// Connect opens a pgx connection pool using the given Config (see
-// config.go for connection string + pool tuning).
-func Connect(ctx context.Context, cfg Config) (*pgxpool.Pool, error) {
-	poolCfg, err := pgxpool.ParseConfig(cfg.DSN)
+// Pool tuning is fixed rather than env-configurable — this is a single
+// small service, not a multi-tenant deployment, so there's no real
+// scenario yet where these need to change per-environment.
+const (
+	maxConns        = 10
+	maxConnLifetime = time.Hour
+	maxConnIdleTime = 30 * time.Minute
+)
+
+// Connect opens a pgx connection pool against the given DSN, e.g.
+// "postgres://user:pass@localhost:5432/wallet_transfer?sslmode=disable".
+func Connect(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
+	cfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
 		return nil, err
 	}
 
-	if cfg.MaxConns > 0 {
-		poolCfg.MaxConns = cfg.MaxConns
-	}
-	if cfg.MinConns > 0 {
-		poolCfg.MinConns = cfg.MinConns
-	}
-	if cfg.MaxConnLifetime > 0 {
-		poolCfg.MaxConnLifetime = cfg.MaxConnLifetime
-	}
-	if cfg.MaxConnIdleTime > 0 {
-		poolCfg.MaxConnIdleTime = cfg.MaxConnIdleTime
-	}
+	cfg.MaxConns = maxConns
+	cfg.MaxConnLifetime = maxConnLifetime
+	cfg.MaxConnIdleTime = maxConnIdleTime
 
-	return pgxpool.NewWithConfig(ctx, poolCfg)
+	return pgxpool.NewWithConfig(ctx, cfg)
 }

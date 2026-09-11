@@ -4,16 +4,18 @@ import (
 	"context"
 	"errors"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/heisenberglit/wallet-transfer-assignment/internal/domain"
 )
 
 // WalletRepository is the pgx-backed implementation of repository.WalletRepository.
 type WalletRepository struct {
-	db DBTX
+	pool *pgxpool.Pool
 }
 
-func NewWalletRepository(db DBTX) *WalletRepository {
-	return &WalletRepository{db: db}
+func NewWalletRepository(pool *pgxpool.Pool) *WalletRepository {
+	return &WalletRepository{pool: pool}
 }
 
 func (r *WalletRepository) Get(ctx context.Context, id string) (*domain.Wallet, error) {

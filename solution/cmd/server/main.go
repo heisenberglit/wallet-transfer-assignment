@@ -2,9 +2,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/heisenberglit/wallet-transfer-assignment/internal/db"
 	httphandler "github.com/heisenberglit/wallet-transfer-assignment/internal/handler/http"
@@ -12,10 +16,17 @@ import (
 	"github.com/heisenberglit/wallet-transfer-assignment/internal/service"
 )
 
+const shutdownTimeout = 10 * time.Second
+
 func main() {
 	ctx := context.Background()
 
-	pool, err := db.Connect(ctx, db.LoadConfigFromEnv())
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		dsn = "postgres://postgres:postgres@localhost:5432/wallet_transfer?sslmode=disable"
+	}
+
+	pool, err := db.Connect(ctx, dsn)
 	if err != nil {
 		log.Fatalf("connect to database: %v", err)
 	}
@@ -35,8 +46,38 @@ func main() {
 		addr = ":8080"
 	}
 
-	log.Printf("listening on %s", addr)
-	if err := http.ListenAndServe(addr, router); err != nil {
-		log.Fatalf("server error: %v", err)
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           router,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+
+	serverErr := make(chan error, 1)
+	go func() {
+		log.Printf("listening on %s", addr)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serverErr <- err
+			return
+		}
+		serverErr <- nil
+	}()
+
+	notifyCtx, stopNotify := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+	defer stopNotify()
+
+	select {
+	case err := <-serverErr:
+		if err != nil {
+			log.Fatalf("server error: %v", err)
+		}
+	case <-notifyCtx.Done():
+		log.Println("shutdown signal received")
+
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer shutdownCancel()
+
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			log.Printf("graceful shutdown failed: %v", err)
+		}
 	}
 }
