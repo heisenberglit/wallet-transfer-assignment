@@ -3,7 +3,7 @@ package main
 import (
 	"context"
 	"errors"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -19,6 +19,8 @@ import (
 const shutdownTimeout = 10 * time.Second
 
 func main() {
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
+
 	ctx := context.Background()
 
 	dsn := os.Getenv("DATABASE_URL")
@@ -28,16 +30,16 @@ func main() {
 
 	pool, err := db.Connect(ctx, dsn)
 	if err != nil {
-		log.Fatalf("connect to database: %v", err)
+		slog.Error("connect to database", "error", err)
+		os.Exit(1)
 	}
 	defer pool.Close()
 
 	wallets := postgres.NewWalletRepository(pool)
 	transfers := postgres.NewTransferRepository(pool)
-	ledger := postgres.NewLedgerRepository(pool)
-	uow := postgres.NewUnitOfWork(pool)
+	executor := postgres.NewTransferExecutor(pool)
 
-	transferService := service.NewTransferService(wallets, transfers, ledger, uow)
+	transferService := service.NewTransferService(wallets, transfers, executor)
 	transferHandler := httphandler.NewTransferHandler(transferService)
 	router := httphandler.NewRouter(transferHandler)
 
@@ -54,7 +56,7 @@ func main() {
 
 	serverErr := make(chan error, 1)
 	go func() {
-		log.Printf("listening on %s", addr)
+		slog.Info("listening", "addr", addr)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			serverErr <- err
 			return
@@ -68,16 +70,17 @@ func main() {
 	select {
 	case err := <-serverErr:
 		if err != nil {
-			log.Fatalf("server error: %v", err)
+			slog.Error("server error", "error", err)
+			os.Exit(1)
 		}
 	case <-notifyCtx.Done():
-		log.Println("shutdown signal received")
+		slog.Info("shutdown signal received")
 
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer shutdownCancel()
 
 		if err := srv.Shutdown(shutdownCtx); err != nil {
-			log.Printf("graceful shutdown failed: %v", err)
+			slog.Error("graceful shutdown failed", "error", err)
 		}
 	}
 }

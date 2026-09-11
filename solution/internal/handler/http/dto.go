@@ -2,10 +2,7 @@ package http
 
 import "github.com/heisenberglit/wallet-transfer-assignment/internal/domain"
 
-// Request/response wire types for the transfer HTTP API. These are
-// transport-layer shapes (JSON tags, flattened fields) and deliberately
-// separate from internal/domain — the domain model shouldn't know about
-// HTTP or JSON.
+// Request/response wire types — kept separate from internal/domain, which shouldn't know about HTTP/JSON.
 
 type createTransferRequest struct {
 	IdempotencyKey string `json:"idempotencyKey"`

@@ -9,10 +9,7 @@ import (
 	"github.com/heisenberglit/wallet-transfer-assignment/internal/service"
 )
 
-// TransferCreator is the slice of TransferService that the HTTP layer
-// depends on. Declaring it here (consumer side) rather than depending on
-// the concrete *service.TransferService lets handler tests substitute a
-// fake without spinning up a database.
+// TransferCreator lets handler tests substitute a fake instead of *service.TransferService.
 type TransferCreator interface {
 	CreateTransfer(ctx context.Context, in service.CreateTransferInput) (*domain.Transfer, error)
 }
@@ -35,9 +32,10 @@ func (h *TransferHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// TODO: request-level validation (required fields, amount > 0) belongs
-	// here; business-rule validation (e.g. wallet existence) belongs in
-	// the service layer.
+	if req.IdempotencyKey == "" || req.FromWalletID == "" || req.ToWalletID == "" {
+		writeError(w, http.StatusBadRequest, "idempotencyKey, fromWalletId, and toWalletId are required")
+		return
+	}
 
 	transfer, err := h.transfers.CreateTransfer(r.Context(), service.CreateTransferInput{
 		IdempotencyKey: req.IdempotencyKey,

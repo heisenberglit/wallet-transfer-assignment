@@ -8,10 +8,6 @@ import (
 	"github.com/heisenberglit/wallet-transfer-assignment/internal/domain"
 )
 
-// writeJSON and writeError are small shared response helpers. They live
-// here (scoped to this handler package) rather than in a generic "utils"
-// package, since they're HTTP-transport concerns, not general-purpose code.
-
 func writeJSON(w http.ResponseWriter, status int, body any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)

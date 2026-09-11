@@ -7,9 +7,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// Pool tuning is fixed rather than env-configurable — this is a single
-// small service, not a multi-tenant deployment, so there's no real
-// scenario yet where these need to change per-environment.
+// Pool tuning is fixed rather than env-configurable — not needed at this scale.
 const (
 	maxConns        = 10
 	maxConnLifetime = time.Hour
