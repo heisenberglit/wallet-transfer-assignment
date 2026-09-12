@@ -12,6 +12,8 @@ import (
 	"github.com/heisenberglit/wallet-transfer-assignment/internal/repository"
 )
 
+const stateWriteTimeout = 5 * time.Second
+
 // CreateTransferInput is the service-layer request for a new transfer.
 type CreateTransferInput struct {
 	IdempotencyKey string
@@ -39,16 +41,14 @@ func NewTransferService(
 }
 
 func (s *TransferService) CreateTransfer(ctx context.Context, in CreateTransferInput) (*domain.Transfer, error) {
+	fingerprint := domain.RequestFingerprint(in.FromWalletID, in.ToWalletID, in.Amount)
+
 	if existing, err := s.transfers.GetByIdempotencyKey(ctx, in.IdempotencyKey); err != nil {
 		return nil, err
 	} else if existing != nil {
 		slog.Info("transfer idempotency replay", "transfer_id", existing.ID,
 			"idempotency_key", in.IdempotencyKey, "state", existing.State)
-		if existing.State == domain.TransferPending {
-			slog.Info("resuming a pending transfer", "transfer_id", existing.ID)
-			return s.apply(ctx, existing, in.IdempotencyKey)
-		}
-		return replay(existing)
+		return s.resumeOrReplay(ctx, existing, in.IdempotencyKey, fingerprint)
 	}
 
 	if in.Amount <= 0 {
@@ -69,6 +69,7 @@ func (s *TransferService) CreateTransfer(ctx context.Context, in CreateTransferI
 	transfer := &domain.Transfer{
 		ID:             uuid.NewString(),
 		IdempotencyKey: in.IdempotencyKey,
+		RequestHash:    fingerprint,
 		FromWalletID:   in.FromWalletID,
 		ToWalletID:     in.ToWalletID,
 		Amount:         in.Amount,
@@ -86,7 +87,7 @@ func (s *TransferService) CreateTransfer(ctx context.Context, in CreateTransferI
 			if existing != nil {
 				slog.Info("transfer idempotency race lost, returning winner",
 					"transfer_id", existing.ID, "idempotency_key", in.IdempotencyKey, "state", existing.State)
-				return replay(existing)
+				return s.resumeOrReplay(ctx, existing, in.IdempotencyKey, fingerprint)
 			}
 		}
 		slog.Error("transfer create failed", "idempotency_key", in.IdempotencyKey, "error", err)
@@ -97,6 +98,27 @@ func (s *TransferService) CreateTransfer(ctx context.Context, in CreateTransferI
 		"from_wallet_id", in.FromWalletID, "to_wallet_id", in.ToWalletID, "amount", in.Amount)
 
 	return s.apply(ctx, transfer, in.IdempotencyKey)
+}
+
+// resumeOrReplay answers for an idempotency key that already has a transfer.
+// Both the pre-flight lookup and the lost-insert race land here, so they
+// cannot answer the same situation differently.
+func (s *TransferService) resumeOrReplay(ctx context.Context, existing *domain.Transfer, key, fingerprint string) (*domain.Transfer, error) {
+	if existing.RequestHash != fingerprint {
+		// Same key, different request. Returning the original would answer for
+		// something the caller never asked for, so refuse instead.
+		slog.Warn("idempotency key reused with a different payload",
+			"transfer_id", existing.ID, "idempotency_key", key)
+		return nil, domain.ErrPayloadMismatch
+	}
+	if existing.State == domain.TransferPending {
+		// Inserted but not finished: the original caller crashed, or is still
+		// running. Drive it to a terminal state rather than stranding the key.
+		// Execute's state CAS makes this safe against a live original.
+		slog.Info("resuming a pending transfer", "transfer_id", existing.ID)
+		return s.apply(ctx, existing, key)
+	}
+	return replay(existing)
 }
 
 func (s *TransferService) apply(ctx context.Context, transfer *domain.Transfer, key string) (*domain.Transfer, error) {
@@ -112,7 +134,14 @@ func (s *TransferService) apply(ctx context.Context, transfer *domain.Transfer, 
 		return transfer, nil
 
 	case errors.Is(err, domain.ErrInsufficientFunds):
-		updateErr := s.transfers.UpdateState(ctx, transfer.ID, domain.TransferPending, domain.TransferFailed)
+		// Detached and bounded: the debit is already rolled back, so if the
+		// client disconnects in this gap the row would otherwise stay PENDING
+		// and a later retry could execute the transfer once funds arrive,
+		// instead of replaying the original failure.
+		failCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), stateWriteTimeout)
+		defer cancel()
+
+		updateErr := s.transfers.UpdateState(failCtx, transfer.ID, domain.TransferPending, domain.TransferFailed)
 		if errors.Is(updateErr, domain.ErrInvalidStateTransition) {
 			return s.outcomeOf(ctx, key, updateErr)
 		}

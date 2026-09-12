@@ -124,6 +124,7 @@ func newPendingTransfer(fromID, toID string, amount int64) *domain.Transfer {
 	return &domain.Transfer{
 		ID:             uuid.NewString(),
 		IdempotencyKey: uuid.NewString(),
+		RequestHash:    domain.RequestFingerprint(fromID, toID, amount),
 		FromWalletID:   fromID,
 		ToWalletID:     toID,
 		Amount:         amount,
@@ -638,7 +639,18 @@ func TestTransferExecutor_Execute_CancelMidTransactionRollsBackCleanly(t *testin
 	done := make(chan error, 1)
 	go func() { done <- executor.Execute(ctx, transfer, debit, credit) }()
 
-	time.Sleep(250 * time.Millisecond) // let Execute reach the blocked UPDATE
+	// Wait for Postgres to actually report Execute as blocked on the lock. A
+	// fixed sleep would only be a guess: if it fired early the cancel would
+	// land before the transaction was even open, and the test would quietly
+	// degrade into the already-canceled case above without proving anything.
+	require.Eventually(t, func() bool {
+		var blocked int
+		err := pool.QueryRow(bg, `
+			SELECT count(*) FROM pg_stat_activity
+			WHERE wait_event_type = 'Lock' AND state = 'active' AND query ILIKE '%wallets%'`).Scan(&blocked)
+		return err == nil && blocked > 0
+	}, 10*time.Second, 20*time.Millisecond, "Execute never blocked on the held row lock")
+
 	cancel()
 
 	select {

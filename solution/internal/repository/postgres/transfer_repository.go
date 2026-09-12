@@ -23,11 +23,11 @@ func NewTransferRepository(pool *pgxpool.Pool) *TransferRepository {
 // ErrIdempotencyConflict and a foreign-key violation to ErrWalletNotFound.
 func (r *TransferRepository) Create(ctx context.Context, t *domain.Transfer) error {
 	const query = `
-		INSERT INTO transfers (id, idempotency_key, from_wallet_id, to_wallet_id, amount, state, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`
+		INSERT INTO transfers (id, idempotency_key, request_hash, from_wallet_id, to_wallet_id, amount, state, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`
 
 	_, err := r.pool.Exec(ctx, query,
-		t.ID, t.IdempotencyKey, t.FromWalletID, t.ToWalletID, t.Amount, t.State, t.CreatedAt, t.UpdatedAt)
+		t.ID, t.IdempotencyKey, t.RequestHash, t.FromWalletID, t.ToWalletID, t.Amount, t.State, t.CreatedAt, t.UpdatedAt)
 	switch {
 	case err == nil:
 		return nil
@@ -43,12 +43,12 @@ func (r *TransferRepository) Create(ctx context.Context, t *domain.Transfer) err
 // GetByIdempotencyKey returns (nil, nil), not an error, when key is unused.
 func (r *TransferRepository) GetByIdempotencyKey(ctx context.Context, key string) (*domain.Transfer, error) {
 	const query = `
-		SELECT id, idempotency_key, from_wallet_id, to_wallet_id, amount, state, created_at, updated_at
+		SELECT id, idempotency_key, request_hash, from_wallet_id, to_wallet_id, amount, state, created_at, updated_at
 		FROM transfers WHERE idempotency_key = $1`
 
 	var t domain.Transfer
 	err := r.pool.QueryRow(ctx, query, key).Scan(
-		&t.ID, &t.IdempotencyKey, &t.FromWalletID, &t.ToWalletID, &t.Amount, &t.State, &t.CreatedAt, &t.UpdatedAt)
+		&t.ID, &t.IdempotencyKey, &t.RequestHash, &t.FromWalletID, &t.ToWalletID, &t.Amount, &t.State, &t.CreatedAt, &t.UpdatedAt)
 	switch {
 	case err == nil:
 		return &t, nil

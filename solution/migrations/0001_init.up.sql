@@ -8,6 +8,7 @@ CREATE TABLE wallets (
 CREATE TABLE transfers (
     id               UUID PRIMARY KEY,
     idempotency_key  TEXT NOT NULL UNIQUE,
+    request_hash     TEXT NOT NULL,
     from_wallet_id   TEXT NOT NULL REFERENCES wallets (id),
     to_wallet_id     TEXT NOT NULL REFERENCES wallets (id),
     amount           BIGINT NOT NULL CHECK (amount > 0),

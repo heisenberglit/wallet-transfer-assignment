@@ -3,12 +3,15 @@ package postgres
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/heisenberglit/wallet-transfer-assignment/internal/domain"
 )
+
+const rollbackTimeout = 5 * time.Second
 
 // TransferExecutor is the pgx-backed implementation of repository.TransferExecutor.
 type TransferExecutor struct {
@@ -46,7 +49,14 @@ func (e *TransferExecutor) Execute(ctx context.Context, transfer *domain.Transfe
 		return err
 	}
 
-	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	// WithoutCancel so the rollback still runs on a dead context, but bounded:
+	// on its own it also strips the deadline, and a stalled connection would
+	// then hold this rollback — and its pool slot — open indefinitely.
+	defer func() {
+		rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), rollbackTimeout)
+		defer cancel()
+		_ = tx.Rollback(rollbackCtx)
+	}()
 
 	first, second := debitWallet, creditWallet
 	if transfer.FromWalletID > transfer.ToWalletID {

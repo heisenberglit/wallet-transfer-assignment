@@ -68,6 +68,11 @@ func validInput() service.CreateTransferInput {
 	}
 }
 
+func validFingerprint() string {
+	in := validInput()
+	return domain.RequestFingerprint(in.FromWalletID, in.ToWalletID, in.Amount)
+}
+
 func TestCreateTransfer_InvalidAmount(t *testing.T) {
 	svc := service.NewTransferService(
 		&fakeWallets{get: func(context.Context, string) (*domain.Wallet, error) {
@@ -119,7 +124,7 @@ func TestCreateTransfer_WalletNotFound(t *testing.T) {
 }
 
 func TestCreateTransfer_IdempotencyReplay(t *testing.T) {
-	existing := &domain.Transfer{ID: "existing-id", IdempotencyKey: "key-1", State: domain.TransferProcessed}
+	existing := &domain.Transfer{ID: "existing-id", IdempotencyKey: "key-1", RequestHash: validFingerprint(), State: domain.TransferProcessed}
 
 	svc := service.NewTransferService(
 		&fakeWallets{get: walletFound},
@@ -145,7 +150,7 @@ func TestCreateTransfer_IdempotencyReplay(t *testing.T) {
 // outcome — error included. Returning it as a plain success would tell a
 // retrying client the money moved when it never did.
 func TestCreateTransfer_ReplayOfFailedTransferReturnsOriginalError(t *testing.T) {
-	failed := &domain.Transfer{ID: "failed-id", IdempotencyKey: "key-1", State: domain.TransferFailed}
+	failed := &domain.Transfer{ID: "failed-id", IdempotencyKey: "key-1", RequestHash: validFingerprint(), State: domain.TransferFailed}
 
 	svc := service.NewTransferService(
 		&fakeWallets{get: walletFound},
@@ -171,7 +176,7 @@ func TestCreateTransfer_ReplayOfFailedTransferReturnsOriginalError(t *testing.T)
 // Same rule on the other replay path: losing the concurrent-insert race to a
 // transfer that went on to FAIL must also surface the failure.
 func TestCreateTransfer_RaceLostToFailedTransferReturnsOriginalError(t *testing.T) {
-	failed := &domain.Transfer{ID: "failed-id", IdempotencyKey: "key-1", State: domain.TransferFailed}
+	failed := &domain.Transfer{ID: "failed-id", IdempotencyKey: "key-1", RequestHash: validFingerprint(), State: domain.TransferFailed}
 
 	calls := 0
 	svc := service.NewTransferService(
@@ -202,8 +207,8 @@ func TestCreateTransfer_RaceLostToFailedTransferReturnsOriginalError(t *testing.
 // stranded in progress forever.
 func TestCreateTransfer_ResumesAPendingTransfer(t *testing.T) {
 	pending := &domain.Transfer{
-		ID: "pending-id", IdempotencyKey: "key-1", FromWalletID: "wallet_1",
-		ToWalletID: "wallet_2", Amount: 100, State: domain.TransferPending,
+		ID: "pending-id", IdempotencyKey: "key-1", RequestHash: validFingerprint(),
+		FromWalletID: "wallet_1", ToWalletID: "wallet_2", Amount: 100, State: domain.TransferPending,
 	}
 
 	var executed bool
@@ -236,10 +241,10 @@ func TestCreateTransfer_ResumesAPendingTransfer(t *testing.T) {
 // attempt loses the state CAS and must report the winner's outcome.
 func TestCreateTransfer_ResumeLosingTheRaceReportsTheWinnersOutcome(t *testing.T) {
 	pending := &domain.Transfer{
-		ID: "pending-id", IdempotencyKey: "key-1", FromWalletID: "wallet_1",
-		ToWalletID: "wallet_2", Amount: 100, State: domain.TransferPending,
+		ID: "pending-id", IdempotencyKey: "key-1", RequestHash: validFingerprint(),
+		FromWalletID: "wallet_1", ToWalletID: "wallet_2", Amount: 100, State: domain.TransferPending,
 	}
-	processed := &domain.Transfer{ID: "pending-id", IdempotencyKey: "key-1", State: domain.TransferProcessed}
+	processed := &domain.Transfer{ID: "pending-id", IdempotencyKey: "key-1", RequestHash: validFingerprint(), State: domain.TransferProcessed}
 
 	lookups := 0
 	svc := service.NewTransferService(
@@ -266,8 +271,8 @@ func TestCreateTransfer_ResumeLosingTheRaceReportsTheWinnersOutcome(t *testing.T
 // A resume that still cannot reach a terminal state must not look successful.
 func TestCreateTransfer_ResumeStillInProgressIsNotASuccess(t *testing.T) {
 	pending := &domain.Transfer{
-		ID: "pending-id", IdempotencyKey: "key-1", FromWalletID: "wallet_1",
-		ToWalletID: "wallet_2", Amount: 100, State: domain.TransferPending,
+		ID: "pending-id", IdempotencyKey: "key-1", RequestHash: validFingerprint(),
+		FromWalletID: "wallet_1", ToWalletID: "wallet_2", Amount: 100, State: domain.TransferPending,
 	}
 
 	svc := service.NewTransferService(
@@ -286,24 +291,68 @@ func TestCreateTransfer_ResumeStillInProgressIsNotASuccess(t *testing.T) {
 	assert.Equal(t, domain.TransferPending, got.State)
 }
 
-// The assignment requires a reused key to return its original result. That has
-// to hold even when the retry's payload is invalid, so the replay lookup runs
-// before request validation.
-func TestCreateTransfer_ReplayWinsOverAnInvalidRetryPayload(t *testing.T) {
-	original := &domain.Transfer{ID: "original-id", IdempotencyKey: "key-1", State: domain.TransferProcessed}
+// A key is bound to the request it was first used with. Reusing it for a
+// different transfer must be refused rather than silently answered with the
+// original, which would report a result for something never asked for.
+func TestCreateTransfer_ReusedKeyWithADifferentPayloadIsRejected(t *testing.T) {
+	original := &domain.Transfer{
+		ID: "original-id", IdempotencyKey: "key-1", RequestHash: validFingerprint(),
+		FromWalletID: "wallet_1", ToWalletID: "wallet_2", Amount: 100, State: domain.TransferProcessed,
+	}
+
+	differsBy := map[string]func(in *service.CreateTransferInput){
+		"amount":           func(in *service.CreateTransferInput) { in.Amount = 999 },
+		"source wallet":    func(in *service.CreateTransferInput) { in.FromWalletID = "wallet_9" },
+		"target wallet":    func(in *service.CreateTransferInput) { in.ToWalletID = "wallet_9" },
+		"reversed wallets": func(in *service.CreateTransferInput) { in.FromWalletID, in.ToWalletID = in.ToWalletID, in.FromWalletID },
+	}
+
+	for name, change := range differsBy {
+		t.Run(name, func(t *testing.T) {
+			svc := service.NewTransferService(
+				&fakeWallets{get: walletFound},
+				&fakeTransfers{
+					getByIdempotencyKey: func(context.Context, string) (*domain.Transfer, error) { return original, nil },
+					create: func(context.Context, *domain.Transfer) error {
+						t.Fatal("Create must not be called for a mismatched replay")
+						return nil
+					},
+				},
+				&fakeExecutor{execute: func(context.Context, *domain.Transfer, domain.LedgerEntry, domain.LedgerEntry) error {
+					t.Fatal("Execute must not be called for a mismatched replay")
+					return nil
+				}},
+			)
+
+			in := validInput()
+			change(&in)
+
+			_, err := svc.CreateTransfer(context.Background(), in)
+			assert.ErrorIs(t, err, domain.ErrPayloadMismatch)
+		})
+	}
+}
+
+// An identical retry is still a replay: the fingerprint matches, so the
+// original result comes back even though validation never ran on it.
+func TestCreateTransfer_IdenticalRetryStillReplays(t *testing.T) {
+	original := &domain.Transfer{
+		ID: "original-id", IdempotencyKey: "key-1", RequestHash: validFingerprint(),
+		FromWalletID: "wallet_1", ToWalletID: "wallet_2", Amount: 100, State: domain.TransferProcessed,
+	}
 
 	svc := service.NewTransferService(
-		&fakeWallets{get: walletFound},
+		&fakeWallets{get: func(context.Context, string) (*domain.Wallet, error) {
+			t.Fatal("a replay must not need to re-check the wallets")
+			return nil, nil
+		}},
 		&fakeTransfers{
 			getByIdempotencyKey: func(context.Context, string) (*domain.Transfer, error) { return original, nil },
 		},
 		&fakeExecutor{},
 	)
 
-	in := validInput()
-	in.Amount = 0 // would be rejected as invalid if validation ran first
-
-	got, err := svc.CreateTransfer(context.Background(), in)
+	got, err := svc.CreateTransfer(context.Background(), validInput())
 	require.NoError(t, err)
 	assert.Same(t, original, got)
 }
@@ -359,7 +408,7 @@ func TestCreateTransfer_InsufficientFunds(t *testing.T) {
 }
 
 func TestCreateTransfer_IdempotencyConflictRace(t *testing.T) {
-	winner := &domain.Transfer{ID: "winner-id", IdempotencyKey: "key-1", State: domain.TransferProcessed}
+	winner := &domain.Transfer{ID: "winner-id", IdempotencyKey: "key-1", RequestHash: validFingerprint(), State: domain.TransferProcessed}
 
 	calls := 0
 	svc := service.NewTransferService(

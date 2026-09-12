@@ -161,8 +161,9 @@ func TestCreateTransfer_ResumesATransferStrandedInPending(t *testing.T) {
 	key := "stranded-" + uuid.NewString()
 	strandedID := uuid.NewString()
 	_, err = pool.Exec(bg,
-		`INSERT INTO transfers (id, idempotency_key, from_wallet_id, to_wallet_id, amount, state)
-		 VALUES ($1, $2, $3, $4, 100, 'PENDING')`, strandedID, key, fromID, toID)
+		`INSERT INTO transfers (id, idempotency_key, request_hash, from_wallet_id, to_wallet_id, amount, state)
+		 VALUES ($1, $2, $3, $4, $5, 100, 'PENDING')`,
+		strandedID, key, domain.RequestFingerprint(fromID, toID, 100), fromID, toID)
 	require.NoError(t, err)
 
 	got, err := svc.CreateTransfer(bg, service.CreateTransferInput{
@@ -186,4 +187,65 @@ func TestCreateTransfer_ResumesATransferStrandedInPending(t *testing.T) {
 		 FROM ledger_entries WHERE transfer_id = $1`, strandedID).Scan(&debits, &credits))
 	assert.Equal(t, 1, debits)
 	assert.Equal(t, 1, credits)
+}
+
+// An idempotency key is bound to the request it was first used with. Reusing
+// it for a different transfer must be refused, not silently answered with the
+// original result for a transfer the caller never asked for.
+func TestCreateTransfer_ReusedKeyIsBoundToItsPayload(t *testing.T) {
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		t.Skip("DATABASE_URL not set; skipping Postgres integration test")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	pool, err := db.Connect(ctx, dsn)
+	require.NoError(t, err)
+	t.Cleanup(pool.Close)
+
+	bg := context.Background()
+	fromID := "test_" + uuid.NewString()
+	toID := "test_" + uuid.NewString()
+	otherID := "test_" + uuid.NewString()
+	_, err = pool.Exec(bg, `INSERT INTO wallets (id, balance) VALUES ($1, 1000), ($2, 0), ($3, 0)`, fromID, toID, otherID)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		ids := []any{fromID, toID, otherID}
+		pool.Exec(bg, `DELETE FROM ledger_entries WHERE wallet_id IN ($1,$2,$3)`, ids...)                               //nolint:errcheck
+		pool.Exec(bg, `DELETE FROM transfers WHERE from_wallet_id IN ($1,$2,$3) OR to_wallet_id IN ($1,$2,$3)`, ids...) //nolint:errcheck
+		pool.Exec(bg, `DELETE FROM wallets WHERE id IN ($1,$2,$3)`, ids...)                                             //nolint:errcheck
+	})
+
+	wallets := postgres.NewWalletRepository(pool)
+	svc := service.NewTransferService(wallets, postgres.NewTransferRepository(pool), postgres.NewTransferExecutor(pool))
+
+	key := "bound-" + uuid.NewString()
+	first, err := svc.CreateTransfer(bg, service.CreateTransferInput{
+		IdempotencyKey: key, FromWalletID: fromID, ToWalletID: toID, Amount: 100,
+	})
+	require.NoError(t, err)
+	require.Equal(t, domain.TransferProcessed, first.State)
+
+	// Same key, different destination and amount.
+	_, err = svc.CreateTransfer(bg, service.CreateTransferInput{
+		IdempotencyKey: key, FromWalletID: fromID, ToWalletID: otherID, Amount: 500,
+	})
+	assert.ErrorIs(t, err, domain.ErrPayloadMismatch)
+
+	// The refusal must not have moved anything.
+	fromWallet, err := wallets.Get(bg, fromID)
+	require.NoError(t, err)
+	assert.EqualValues(t, 900, fromWallet.Balance, "only the original transfer may have applied")
+
+	other, err := wallets.Get(bg, otherID)
+	require.NoError(t, err)
+	assert.EqualValues(t, 0, other.Balance, "the mismatched request must not have executed")
+
+	// An identical retry of the original still replays cleanly.
+	again, err := svc.CreateTransfer(bg, service.CreateTransferInput{
+		IdempotencyKey: key, FromWalletID: fromID, ToWalletID: toID, Amount: 100,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, first.ID, again.ID)
 }

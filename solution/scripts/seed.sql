@@ -1,5 +1,18 @@
 BEGIN;
 
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM transfers
+        WHERE (from_wallet_id IN ('wallet_1', 'wallet_2', 'wallet_3')
+            OR to_wallet_id IN ('wallet_1', 'wallet_2', 'wallet_3'))
+          AND NOT (from_wallet_id IN ('wallet_1', 'wallet_2', 'wallet_3')
+               AND to_wallet_id IN ('wallet_1', 'wallet_2', 'wallet_3'))
+    ) THEN
+        RAISE EXCEPTION 'seed.sql: transfers exist between a seeded wallet and one outside the seed set; refusing to reset. Use a clean database (make down && make up && make migrate-up).';
+    END IF;
+END $$;
+
 DELETE FROM ledger_entries
 WHERE wallet_id IN ('wallet_1', 'wallet_2', 'wallet_3')
    OR transfer_id IN (

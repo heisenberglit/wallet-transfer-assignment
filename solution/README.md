@@ -130,6 +130,8 @@ see the status table below for replays of failed or in-flight ones):
 | Success                                 | 201    |
 | Replayed duplicate of a *processed* transfer | 201, identical body to the original |
 | Replayed duplicate of a *failed* transfer | 422, identical to the original response |
+| Replay while the original is still in flight | 409 |
+| Same `idempotencyKey`, different payload      | 409 |
 | `amount <= 0` / self-transfer            | 422    |
 | Insufficient funds                       | 422    |
 | Unknown wallet                           | 404    |
@@ -214,8 +216,9 @@ docker compose exec -T postgres psql -U postgres -d wallet_transfer -f - < migra
 DATABASE_URL="postgres://postgres:postgres@localhost:5432/wallet_transfer?sslmode=disable" go test ./...
 ```
 
-Both were run against a real local Postgres as part of building this,
-not just written and left unverified.
+The unit tests need no database; the integration tests were run against a
+real local Postgres as part of building this, not written and left
+unverified.
 
 ## Observability
 
