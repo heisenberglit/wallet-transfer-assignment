@@ -10,7 +10,7 @@ lint:
 	golangci-lint run ./...
 
 fmt:
-	gofmt -w .
+	go fmt ./...
 
 fmt-check:
 	@unformatted=$$(gofmt -l .); \
