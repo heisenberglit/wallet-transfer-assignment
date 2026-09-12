@@ -202,6 +202,43 @@ func TestCreateTransfer_RaceLostToFailedTransferReturnsOriginalError(t *testing.
 	assert.Same(t, failed, got)
 }
 
+// The debit is already rolled back by the time the PENDING -> FAILED write
+// runs, so that write must not ride on the request context: if the client
+// disconnects in the gap the row would stay PENDING, and a later retry would
+// execute the transfer (once funds arrive) instead of replaying the failure.
+func TestCreateTransfer_FailedTransitionSurvivesClientDisconnect(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	var updateCtxErr error
+	var updated bool
+	svc := service.NewTransferService(
+		&fakeWallets{get: walletFound},
+		&fakeTransfers{
+			updateState: func(updateCtx context.Context, _ string, from, to domain.TransferState) error {
+				updated = true
+				updateCtxErr = updateCtx.Err() // must not already be canceled
+				assert.Equal(t, domain.TransferPending, from)
+				assert.Equal(t, domain.TransferFailed, to)
+				return nil
+			},
+		},
+		&fakeExecutor{execute: func(context.Context, *domain.Transfer, domain.LedgerEntry, domain.LedgerEntry) error {
+			// The client goes away exactly as the debit is rejected.
+			cancel()
+			return domain.ErrInsufficientFunds
+		}},
+	)
+
+	got, err := svc.CreateTransfer(ctx, validInput())
+
+	assert.ErrorIs(t, err, domain.ErrInsufficientFunds)
+	require.NotNil(t, got)
+	assert.Equal(t, domain.TransferFailed, got.State)
+	require.True(t, updated, "the FAILED transition must still be attempted")
+	assert.NoError(t, updateCtxErr,
+		"the FAILED write must run on a context detached from the canceled request")
+}
+
 // A transfer created but never executed (its caller crashed in the gap) must
 // be carried to a terminal state by the next retry of the same key, not left
 // stranded in progress forever.

@@ -38,16 +38,25 @@ only ever hold two functions used from one file.
 POST /transfers
    │
    ▼
-TransferHandler.Create          (decode JSON, map errors → HTTP status)
+TransferHandler.Create          (decode JSON, reject trailing data, map errors → status)
    │
    ▼
-TransferService.CreateTransfer  (validate, check idempotency, orchestrate)
+TransferService.CreateTransfer
    │
-   ├─ wallets.Get × 2            confirm both wallets exist
-   ├─ transfers.GetByIdempotencyKey   replay if this key was already used
-   ├─ transfers.Create           insert the transfer row as PENDING
-   └─ executor.Execute           atomic debit + credit + ledger + PROCESSED
+   ├─ fingerprint the request         sha256(from ∥ to ∥ amount)
+   ├─ transfers.GetByIdempotencyKey   has this key been used?
+   │     ├─ fingerprint differs  → refuse (409)
+   │     ├─ still PENDING        → resume it, then return its terminal result
+   │     └─ terminal             → replay that outcome, error included
+   ├─ validate                        amount > 0, wallets differ
+   ├─ wallets.Get × 2                 confirm both wallets exist
+   ├─ transfers.Create                insert the transfer row as PENDING
+   └─ executor.Execute                atomic debit + credit + ledger + PROCESSED
 ```
+
+The idempotency lookup runs **before** validation deliberately: a key that
+already has a transfer must answer with that transfer, not with a fresh
+validation error about the retry's payload.
 
 `TransferExecutor.Execute` (`internal/repository/postgres/transfer_executor.go`)
 is the one place a database transaction spans more than one table. It's a
@@ -87,13 +96,26 @@ same wallet first instead of forming a circular wait.
 concurrently in both directions between the same two wallets and would
 fail (with that exact SQLSTATE) if this regressed.
 
-Two more things `Execute` guards against, both cheap and worth having:
-the transfer's state transition is a compare-and-swap
-(`WHERE state = 'PENDING'`), not an unconditional write, so a second call
-against an already-`PROCESSED` transfer fails loudly instead of
-re-applying the debit/credit; and the debit/credit amounts passed in are
-checked against `transfer.Amount` before any write, so a caller bug can't
-silently write a ledger entry that doesn't match what was actually moved.
+Three more things `Execute` guards against, all cheap and worth having.
+
+The state transition is a compare-and-swap (`WHERE state = 'PENDING'`),
+not an unconditional write, so a second call against an already-`PROCESSED`
+transfer fails loudly instead of re-applying the debit/credit. That CAS is
+also what makes resuming a stranded transfer safe: if two callers execute
+the same transfer at once, one commits and the other's CAS matches nothing,
+rolling its whole transaction back.
+
+Both ledger entries are checked against the transfer before the transaction
+opens — type, transfer id, wallet ids *and* amounts. The balance updates are
+driven by `transfer`, but the ledger rows are written from the entries the
+caller passes in, so validating only the amounts would still let a caller bug
+move exactly the right money and record a reversed or cross-wallet pair
+against it.
+
+The deferred rollback runs on `context.WithoutCancel(ctx)` so it still
+reaches Postgres on a dead context, but wrapped in a short timeout: on its
+own `WithoutCancel` also strips the deadline, and a stalled connection would
+then hold the rollback — and its pool slot — open indefinitely.
 
 ## API
 
@@ -137,11 +159,31 @@ see the status table below for replays of failed or in-flight ones):
 | Unknown wallet                           | 404    |
 | Malformed JSON body                      | 400    |
 
-A replay reproduces the **original outcome, error included**. An earlier
+### Idempotency contract
+
+**A replay reproduces the original outcome, error included.** An earlier
 version returned `201 {"state":"FAILED"}` when a failed transfer's key was
 retried, which told a retrying client the money had moved when it never
-had; `replay()` in `transfer_service.go` now re-raises the original error,
-pinned by tests at both the service and handler layers.
+had. Only a `PROCESSED` transfer is ever reported as a success.
+
+**A key is bound to the request it was first used with.** `transfers` stores
+`request_hash`, a SHA-256 of `from ∥ to ∥ amount` (NUL-separated so two
+different requests cannot join to the same string). Every replay recomputes
+it and compares. Without this, the key is just a string the server has seen
+before, so reusing it for a *different* transfer would silently return the
+first one's result — the caller would be told their transfer succeeded when
+nothing they asked for ever happened. A mismatch is refused with `409`.
+
+**A transfer that was created but never executed gets finished, not
+stranded.** The `PENDING` row is committed before `Execute` runs, so a crash
+in that gap leaves a row with no outcome. A retry of the same key resumes it
+rather than reporting it permanently in progress. If the original caller is
+in fact still running, the state CAS above means exactly one of them commits.
+
+The `PENDING → FAILED` write after an insufficient-funds rollback runs on a
+detached, bounded context. On the request context it would be cancelled by a
+client disconnect, leaving the row `PENDING` — and a later retry would then
+execute the transfer once funds arrived instead of replaying the failure.
 
 ### `GET /healthz`
 
@@ -171,11 +213,13 @@ make seed            # seeds wallet_1 (1000), wallet_2 (500), wallet_3 (0) — s
 go run ./cmd/server
 ```
 
-`make seed` is re-runnable — it resets those three wallets' balances
-instead of erroring on conflict, so you can reset state between manual
-test runs without recreating the database. There's no wallet-creation
-API yet (see Known Limitations), so this script is the only way to get
-a wallet to test against.
+`make seed` is re-runnable and is a true reset: it clears prior transfers,
+ledger rows and idempotency keys for those three wallets before restoring
+their balances, so state can't disagree with the ledger and an old key can't
+replay. If it finds a transfer with one leg *outside* the seeded set it
+refuses rather than corrupting that wallet's balance, and tells you to start
+from a clean database. There's no wallet-creation API yet (see Known
+Limitations), so this script is the only way to get a wallet to test against.
 
 ```bash
 curl -X POST http://localhost:8080/transfers \
@@ -189,22 +233,25 @@ curl -X POST http://localhost:8080/transfers \
 go test ./...                    # unit tests only; Postgres tests self-skip
 ```
 
-Two kinds of tests:
+**67 tests.** Two kinds:
 
 - **Unit tests** — no database, using hand-rolled fakes.
-  `internal/service/transfer_service_test.go` covers validation, both
-  idempotency-replay paths (including replay of a *failed* transfer), the
-  same-key race, insufficient funds, and the success path.
+  `internal/service/transfer_service_test.go` covers validation, every
+  replay path (processed, failed, still-pending, resumed, and resume losing
+  the race), payload-mismatch refusal, the same-key race, and that the
+  `FAILED` transition survives a client disconnect.
   `internal/handler/http/transfer_handler_test.go` covers the transport
   contract: every error→status mapping, that a failed transfer is never
   reported as a 201, that internal error details aren't leaked to the
-  client, and that malformed requests never reach the service.
+  client, and that malformed or trailing-data bodies never reach the service.
 - **Integration tests** (`internal/repository/postgres/integration_test.go`,
   `internal/service/integration_test.go`) — need a real Postgres with the
   migration applied; they skip themselves (not fail) if `DATABASE_URL`
-  isn't set. Cover repository CRUD, ledger balancing, the executor's
-  success/insufficient-funds/double-execution/amount-guard/cancelled-context
-  paths, and four concurrency tests — simultaneous debits on one wallet,
+  isn't set. Cover repository behaviour, the guarded state transition,
+  ledger balancing, the executor's success / insufficient-funds /
+  double-execution / entry-validation / cancelled-context paths, resuming a
+  transfer stranded in `PENDING`, payload-mismatch refusal, and four
+  concurrency tests — simultaneous debits on one wallet,
   opposite-direction transfers (the deadlock regression), a three-way
   circular cycle, and 20 concurrent `CreateTransfer` calls sharing one
   idempotency key. These are what actually prove the concurrency-safety
@@ -220,6 +267,19 @@ The unit tests need no database; the integration tests were run against a
 real local Postgres as part of building this, not written and left
 unverified.
 
+Every concurrency test releases its workers from a **two-phase barrier** —
+each worker finishes its setup and signals ready, and only once all of them
+are parked is the gate opened. An earlier version closed the gate straight
+after launching the goroutines, which does not guarantee they have reached
+it; the workers could then run one after another and a read-then-write
+implementation would pass. Several of these were also mutation-tested:
+reverting the fix they guard makes them fail.
+
+```bash
+make lint        # golangci-lint, 13 linters (.golangci.yml)
+make fmt-check   # fails if anything is not gofmt'd
+```
+
 ## Observability
 
 Structured (`log/slog`, JSON in production) logs, not `log.Printf`:
@@ -232,9 +292,12 @@ Structured (`log/slog`, JSON in production) logs, not `log.Printf`:
   each tagged with `transfer_id` and `idempotency_key` so one transfer's
   whole lifecycle can be traced through the logs.
 
-Not implemented: metrics/counters (e.g. `PROCESSED` vs `FAILED` rate)
-and anything that would detect a transfer stuck in `PENDING` after a
-crash — see Known Limitations.
+A resumed transfer and a key reused with a different payload each log a
+line too, so both are visible in operation rather than only in tests.
+
+Not implemented: metrics/counters (e.g. `PROCESSED` vs `FAILED` rate), and
+there is no sweeper that finds a `PENDING` row nobody ever retries — see
+Known Limitations.
 
 ## Deploy
 
@@ -259,6 +322,11 @@ without an explicit check the process would bind its port, log
 it. `db.Connect` pings (capped at 5s) and returns the error, which
 `run()` turns into a non-zero exit — so a container that comes up with no
 database crashes instead of pretending to be healthy.
+
+The server sets `ReadHeaderTimeout`, `ReadTimeout`, `WriteTimeout` and
+`IdleTimeout`, and the handler caps the request body at 64 KiB. Without a
+read timeout a client can hold a connection open indefinitely by trickling
+the body a byte at a time.
 
 `GET /healthz` gives an orchestrator a liveness signal. Kept deliberately
 simple for the scope of this assignment: a readiness probe that reports
@@ -329,8 +397,13 @@ anything if some future code path set it by hand.
 not a separate `idempotency_records` table.**
 ✅ One fewer table; the constraint is what actually prevents the
 duplicate, so there's no gap between "checked" and "enforced."
-❌ Can only dedupe by key — reusing a key with a *different* payload is
-not detected (see Known Limitations).
+✅ The key is bound to its payload by `request_hash`, so it cannot answer
+for a different request.
+❌ The fingerprint is a second thing to keep in step with the payload: add a
+field to the request and forget to hash it, and two different transfers
+become indistinguishable again. For a payload this small, comparing the
+three stored columns directly would be equivalent and one concept fewer —
+the hash is chosen because it stays a single column as the payload grows.
 
 **Wallet balance as a stored, updated column (not derived from summing
 `ledger_entries`).**
@@ -342,13 +415,15 @@ reconciles them against each other.
 
 ## Known Limitations
 
-- **Idempotency-key reuse with a different payload isn't detected.** A
-  client resending the same key with different amount/wallets silently
-  gets the original transfer back. Fixing this needs storing (or
-  hashing) the original request and comparing on lookup.
-- **A crash between creating the `PENDING` row and `Execute` running
-  leaves that transfer stuck in `PENDING` forever**, with no
-  reconciliation job to find and resolve it.
+- **A `PENDING` row that nobody retries is never resolved.** A retry of the
+  same key resumes it, so a client that retries recovers on its own — but if
+  the caller crashes and never comes back, the row sits there. There is no
+  sweeper to find and finalise it, and until something does, the funds are
+  neither moved nor released.
+- **The fingerprint covers the request, not the client.** Two different
+  callers picking the same key for genuinely different transfers get a 409,
+  which is correct but opaque; scoping keys per API client would be the real
+  fix.
 - **No wallet-creation or balance-read API** — wallets only exist via
   `scripts/seed.sql` (`make seed`). Listed as optional in the assignment,
   but worth calling out since there's no way to create an arbitrary
