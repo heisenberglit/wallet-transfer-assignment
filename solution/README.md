@@ -130,7 +130,7 @@ see the status table below for replays of failed or in-flight ones):
 | Success                                 | 201    |
 | Replayed duplicate of a *processed* transfer | 201, identical body to the original |
 | Replayed duplicate of a *failed* transfer | 422, identical to the original response |
-| Replay while the original is still in flight | 409 |
+| Replay of a PENDING transfer              | resumes it and returns the terminal result (201 or 422) |
 | Same `idempotencyKey`, different payload      | 409 |
 | `amount <= 0` / self-transfer            | 422    |
 | Insufficient funds                       | 422    |
