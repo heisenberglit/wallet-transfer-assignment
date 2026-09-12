@@ -16,7 +16,7 @@ type WalletRepository interface {
 type TransferRepository interface {
 	Create(ctx context.Context, t *domain.Transfer) error
 	GetByIdempotencyKey(ctx context.Context, key string) (*domain.Transfer, error)
-	UpdateState(ctx context.Context, id string, state domain.TransferState) error
+	UpdateState(ctx context.Context, id string, from, to domain.TransferState) error
 }
 
 // TransferExecutor atomically debits, credits, writes the ledger

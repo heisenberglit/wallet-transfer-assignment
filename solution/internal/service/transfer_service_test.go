@@ -29,7 +29,7 @@ func walletFound(_ context.Context, id string) (*domain.Wallet, error) {
 type fakeTransfers struct {
 	create              func(ctx context.Context, t *domain.Transfer) error
 	getByIdempotencyKey func(ctx context.Context, key string) (*domain.Transfer, error)
-	updateState         func(ctx context.Context, id string, state domain.TransferState) error
+	updateState         func(ctx context.Context, id string, from, to domain.TransferState) error
 }
 
 func (f *fakeTransfers) Create(ctx context.Context, t *domain.Transfer) error {
@@ -44,11 +44,11 @@ func (f *fakeTransfers) GetByIdempotencyKey(ctx context.Context, key string) (*d
 	}
 	return f.getByIdempotencyKey(ctx, key)
 }
-func (f *fakeTransfers) UpdateState(ctx context.Context, id string, state domain.TransferState) error {
+func (f *fakeTransfers) UpdateState(ctx context.Context, id string, from, to domain.TransferState) error {
 	if f.updateState == nil {
 		return nil
 	}
-	return f.updateState(ctx, id, state)
+	return f.updateState(ctx, id, from, to)
 }
 
 type fakeExecutor struct {
@@ -197,6 +197,54 @@ func TestCreateTransfer_RaceLostToFailedTransferReturnsOriginalError(t *testing.
 	assert.Same(t, failed, got)
 }
 
+// A replay that finds the winner still PENDING must not be reported as a
+// success: the winner may yet fail, so its outcome is simply not known.
+func TestCreateTransfer_ReplayOfPendingTransferIsNotASuccess(t *testing.T) {
+	pending := &domain.Transfer{ID: "pending-id", IdempotencyKey: "key-1", State: domain.TransferPending}
+
+	svc := service.NewTransferService(
+		&fakeWallets{get: walletFound},
+		&fakeTransfers{
+			getByIdempotencyKey: func(context.Context, string) (*domain.Transfer, error) { return pending, nil },
+			create: func(context.Context, *domain.Transfer) error {
+				t.Fatal("Create should not be called on an idempotency replay")
+				return nil
+			},
+		},
+		&fakeExecutor{execute: func(context.Context, *domain.Transfer, domain.LedgerEntry, domain.LedgerEntry) error {
+			t.Fatal("Execute should not be called on an idempotency replay")
+			return nil
+		}},
+	)
+
+	got, err := svc.CreateTransfer(context.Background(), validInput())
+	assert.ErrorIs(t, err, domain.ErrTransferInProgress)
+	require.NotNil(t, got)
+	assert.Equal(t, domain.TransferPending, got.State)
+}
+
+// The assignment requires a reused key to return its original result. That has
+// to hold even when the retry's payload is invalid, so the replay lookup runs
+// before request validation.
+func TestCreateTransfer_ReplayWinsOverAnInvalidRetryPayload(t *testing.T) {
+	original := &domain.Transfer{ID: "original-id", IdempotencyKey: "key-1", State: domain.TransferProcessed}
+
+	svc := service.NewTransferService(
+		&fakeWallets{get: walletFound},
+		&fakeTransfers{
+			getByIdempotencyKey: func(context.Context, string) (*domain.Transfer, error) { return original, nil },
+		},
+		&fakeExecutor{},
+	)
+
+	in := validInput()
+	in.Amount = 0 // would be rejected as invalid if validation ran first
+
+	got, err := svc.CreateTransfer(context.Background(), in)
+	require.NoError(t, err)
+	assert.Same(t, original, got)
+}
+
 func TestCreateTransfer_Success(t *testing.T) {
 	var executed bool
 
@@ -228,8 +276,9 @@ func TestCreateTransfer_InsufficientFunds(t *testing.T) {
 	svc := service.NewTransferService(
 		&fakeWallets{get: walletFound},
 		&fakeTransfers{
-			updateState: func(_ context.Context, _ string, state domain.TransferState) error {
-				assert.Equal(t, domain.TransferFailed, state)
+			updateState: func(_ context.Context, _ string, from, to domain.TransferState) error {
+				assert.Equal(t, domain.TransferPending, from, "must be a guarded PENDING -> FAILED transition")
+				assert.Equal(t, domain.TransferFailed, to)
 				failedStateSet = true
 				return nil
 			},

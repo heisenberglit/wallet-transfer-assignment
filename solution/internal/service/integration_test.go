@@ -2,6 +2,7 @@ package service_test
 
 import (
 	"context"
+	"errors"
 	"os"
 	"sync"
 	"testing"
@@ -12,6 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/heisenberglit/wallet-transfer-assignment/internal/db"
+	"github.com/heisenberglit/wallet-transfer-assignment/internal/domain"
 	"github.com/heisenberglit/wallet-transfer-assignment/internal/repository/postgres"
 	"github.com/heisenberglit/wallet-transfer-assignment/internal/service"
 )
@@ -56,8 +58,9 @@ func TestCreateTransfer_ConcurrentSameIdempotencyKey(t *testing.T) {
 
 	start := make(chan struct{})
 	results := make([]struct {
-		id  string
-		err error
+		id    string
+		state domain.TransferState
+		err   error
 	}, concurrency)
 
 	var wg sync.WaitGroup
@@ -75,20 +78,32 @@ func TestCreateTransfer_ConcurrentSameIdempotencyKey(t *testing.T) {
 			results[i].err = err
 			if transfer != nil {
 				results[i].id = transfer.ID
+				results[i].state = transfer.State
 			}
 		}(i)
 	}
 	close(start)
 	wg.Wait()
 
+	// Every caller must see the same transfer, and none may be told it
+	// succeeded unless it is actually PROCESSED. A caller that observed an
+	// in-flight winner gets ErrTransferInProgress, never a silent PENDING
+	// dressed up as success.
 	firstID := ""
 	for i, r := range results {
+		if errors.Is(r.err, domain.ErrTransferInProgress) {
+			assert.Equalf(t, domain.TransferPending, r.state, "call %d", i)
+			continue
+		}
 		require.NoErrorf(t, r.err, "call %d", i)
+		assert.Equalf(t, domain.TransferProcessed, r.state,
+			"call %d reported success, so the transfer must be PROCESSED", i)
 		if firstID == "" {
 			firstID = r.id
 		}
 		assert.Equalf(t, firstID, r.id, "call %d returned a different transfer than the others", i)
 	}
+	require.NotEmpty(t, firstID, "at least one caller must observe the processed transfer")
 
 	fromWallet, err := wallets.Get(context.Background(), fromID)
 	require.NoError(t, err)
@@ -97,4 +112,17 @@ func TestCreateTransfer_ConcurrentSameIdempotencyKey(t *testing.T) {
 	toWallet, err := wallets.Get(context.Background(), toID)
 	require.NoError(t, err)
 	assert.EqualValues(t, 100, toWallet.Balance)
+
+	// Exactly one transfer row and exactly one balanced ledger pair.
+	var transferRows, debits, credits int
+	require.NoError(t, pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM transfers WHERE idempotency_key = $1`, idempotencyKey).Scan(&transferRows))
+	assert.Equal(t, 1, transferRows)
+
+	require.NoError(t, pool.QueryRow(context.Background(),
+		`SELECT count(*) FILTER (WHERE type = 'DEBIT'), count(*) FILTER (WHERE type = 'CREDIT')
+		 FROM ledger_entries l JOIN transfers t ON t.id = l.transfer_id
+		 WHERE t.idempotency_key = $1`, idempotencyKey).Scan(&debits, &credits))
+	assert.Equal(t, 1, debits, "exactly one debit row")
+	assert.Equal(t, 1, credits, "exactly one credit row")
 }

@@ -39,6 +39,14 @@ func NewTransferService(
 }
 
 func (s *TransferService) CreateTransfer(ctx context.Context, in CreateTransferInput) (*domain.Transfer, error) {
+	if existing, err := s.transfers.GetByIdempotencyKey(ctx, in.IdempotencyKey); err != nil {
+		return nil, err
+	} else if existing != nil {
+		slog.Info("transfer idempotency replay", "transfer_id", existing.ID,
+			"idempotency_key", in.IdempotencyKey, "state", existing.State)
+		return replay(existing)
+	}
+
 	if in.Amount <= 0 {
 		return nil, domain.ErrInvalidAmount
 	}
@@ -51,14 +59,6 @@ func (s *TransferService) CreateTransfer(ctx context.Context, in CreateTransferI
 	}
 	if _, err := s.wallets.Get(ctx, in.ToWalletID); err != nil {
 		return nil, err
-	}
-
-	if existing, err := s.transfers.GetByIdempotencyKey(ctx, in.IdempotencyKey); err != nil {
-		return nil, err
-	} else if existing != nil {
-		slog.Info("transfer idempotency replay", "transfer_id", existing.ID,
-			"idempotency_key", in.IdempotencyKey, "state", existing.State)
-		return replay(existing)
 	}
 
 	now := time.Now()
@@ -97,7 +97,7 @@ func (s *TransferService) CreateTransfer(ctx context.Context, in CreateTransferI
 
 	if err := s.executor.Execute(ctx, transfer, debit, credit); err != nil {
 		if errors.Is(err, domain.ErrInsufficientFunds) {
-			if updateErr := s.transfers.UpdateState(ctx, transfer.ID, domain.TransferFailed); updateErr != nil {
+			if updateErr := s.transfers.UpdateState(ctx, transfer.ID, domain.TransferPending, domain.TransferFailed); updateErr != nil {
 				slog.Error("transfer state update to FAILED failed", "transfer_id", transfer.ID, "error", updateErr)
 				return nil, updateErr
 			}
@@ -115,10 +115,14 @@ func (s *TransferService) CreateTransfer(ctx context.Context, in CreateTransferI
 }
 
 // replay reproduces the original outcome for an already-seen idempotency key,
-// error included — a retry of a failed transfer must not look like a success.
+// error included — only a PROCESSED transfer may be reported as a success.
 func replay(existing *domain.Transfer) (*domain.Transfer, error) {
-	if existing.State == domain.TransferFailed {
+	switch existing.State {
+	case domain.TransferFailed:
 		return existing, domain.ErrInsufficientFunds
+	case domain.TransferPending:
+		return existing, domain.ErrTransferInProgress
+	default:
+		return existing, nil
 	}
-	return existing, nil
 }

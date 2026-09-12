@@ -110,7 +110,8 @@ Request:
 }
 ```
 
-Response (201, both on the first call and on a replayed duplicate):
+Response (201 on the first call, and on a replay of a *processed* transfer —
+see the status table below for replays of failed or in-flight ones):
 
 ```json
 {
@@ -237,7 +238,7 @@ crash — see Known Limitations.
 ```bash
 docker build -t wallet-transfer-service .
 docker run -p 8080:8080 \
-  -e DATABASE_URL="postgres://user:pass@host:5432/wallet_transfer?sslmode=disable" \
+  -e DATABASE_URL="postgres://user:pass@host:5432/wallet_transfer?sslmode=require" \
   wallet-transfer-service
 ```
 

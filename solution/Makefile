@@ -1,4 +1,4 @@
-.PHONY: run test test-integration lint fmt migrate-up migrate-down seed up down
+.PHONY: run test test-integration lint fmt fmt-check migrate-up migrate-down seed up down
 
 run:
 	go run ./cmd/server
@@ -10,7 +10,13 @@ lint:
 	golangci-lint run ./...
 
 fmt:
-	gofmt -l .
+	gofmt -w .
+
+fmt-check:
+	@unformatted=$$(gofmt -l .); \
+	if [ -n "$$unformatted" ]; then \
+		echo "not gofmt'd:"; echo "$$unformatted"; exit 1; \
+	fi
 
 up:
 	docker compose up -d

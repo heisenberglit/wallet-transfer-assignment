@@ -88,6 +88,7 @@ func TestCreate_ServiceErrorsMapToStatusCodes(t *testing.T) {
 		{"same wallet", domain.ErrSameWallet, http.StatusUnprocessableEntity},
 		{"wallet not found", domain.ErrWalletNotFound, http.StatusNotFound},
 		{"idempotency conflict", domain.ErrIdempotencyConflict, http.StatusConflict},
+		{"transfer still in progress", domain.ErrTransferInProgress, http.StatusConflict},
 		{"unexpected error", errors.New("boom"), http.StatusInternalServerError},
 	}
 
@@ -119,6 +120,8 @@ func TestCreate_RejectsBadRequestsWithoutCallingTheService(t *testing.T) {
 	}{
 		{"malformed json", `{"idempotencyKey":`},
 		{"empty body", ``},
+		{"two json objects", validBody + validBody},
+		{"trailing junk after a valid object", validBody + "garbage"},
 		{"missing idempotency key", `{"fromWalletId":"wallet_1","toWalletId":"wallet_2","amount":100}`},
 		{"missing from wallet", `{"idempotencyKey":"key-1","toWalletId":"wallet_2","amount":100}`},
 		{"missing to wallet", `{"idempotencyKey":"key-1","fromWalletId":"wallet_1","amount":100}`},

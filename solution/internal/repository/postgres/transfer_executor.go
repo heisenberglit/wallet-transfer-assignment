@@ -37,8 +37,8 @@ func NewTransferExecutor(pool *pgxpool.Pool) *TransferExecutor {
 //   - The state change is a compare-and-swap (WHERE state = PENDING), so a
 //     second Execute against the same transfer fails instead of re-applying it.
 func (e *TransferExecutor) Execute(ctx context.Context, transfer *domain.Transfer, debit, credit domain.LedgerEntry) error {
-	if debit.Amount != transfer.Amount || credit.Amount != transfer.Amount {
-		return fmt.Errorf("ledger entries inconsistent with transfer %s", transfer.ID)
+	if err := checkEntries(transfer, debit, credit); err != nil {
+		return err
 	}
 
 	tx, err := e.pool.Begin(ctx)
@@ -80,6 +80,26 @@ func (e *TransferExecutor) Execute(ctx context.Context, transfer *domain.Transfe
 	}
 
 	return tx.Commit(ctx)
+}
+
+// checkEntries rejects a debit/credit pair that disagrees with the transfer.
+// The balance updates are driven by transfer, but the ledger rows are written
+// from these entries, so without this a caller bug could move the right money
+// and record a reversed, cross-wallet, or cross-transfer pair against it.
+func checkEntries(transfer *domain.Transfer, debit, credit domain.LedgerEntry) error {
+	switch {
+	case debit.Type != domain.LedgerDebit, credit.Type != domain.LedgerCredit:
+		return fmt.Errorf("%w: entry types are not one debit and one credit", domain.ErrInconsistentLedger)
+	case debit.TransferID != transfer.ID, credit.TransferID != transfer.ID:
+		return fmt.Errorf("%w: entries reference a different transfer than %s", domain.ErrInconsistentLedger, transfer.ID)
+	case debit.WalletID != transfer.FromWalletID:
+		return fmt.Errorf("%w: debit wallet %s is not the source wallet", domain.ErrInconsistentLedger, debit.WalletID)
+	case credit.WalletID != transfer.ToWalletID:
+		return fmt.Errorf("%w: credit wallet %s is not the destination wallet", domain.ErrInconsistentLedger, credit.WalletID)
+	case debit.Amount != transfer.Amount, credit.Amount != transfer.Amount:
+		return fmt.Errorf("%w: entry amounts do not equal the transfer amount", domain.ErrInconsistentLedger)
+	}
+	return nil
 }
 
 func debitWallet(ctx context.Context, tx pgx.Tx, transfer *domain.Transfer) error {

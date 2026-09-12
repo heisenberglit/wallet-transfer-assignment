@@ -59,8 +59,15 @@ func (r *TransferRepository) GetByIdempotencyKey(ctx context.Context, key string
 	}
 }
 
-func (r *TransferRepository) UpdateState(ctx context.Context, id string, state domain.TransferState) error {
-	const query = `UPDATE transfers SET state = $2, updated_at = now() WHERE id = $1`
-	_, err := r.pool.Exec(ctx, query, id, state)
-	return err
+func (r *TransferRepository) UpdateState(ctx context.Context, id string, from, to domain.TransferState) error {
+	const query = `UPDATE transfers SET state = $3, updated_at = now() WHERE id = $1 AND state = $2`
+
+	tag, err := r.pool.Exec(ctx, query, id, from, to)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return domain.ErrInvalidStateTransition
+	}
+	return nil
 }

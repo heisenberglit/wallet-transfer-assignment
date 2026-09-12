@@ -3,6 +3,8 @@ package http
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 
 	"github.com/heisenberglit/wallet-transfer-assignment/internal/domain"
@@ -27,8 +29,15 @@ func NewTransferHandler(transfers TransferCreator) *TransferHandler {
 // POST /transfers
 func (h *TransferHandler) Create(w http.ResponseWriter, r *http.Request) {
 	var req createTransferRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	decoder := json.NewDecoder(r.Body)
+	if err := decoder.Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	// Decode stops after the first JSON value, so without this a second object
+	// or trailing junk would be ignored and the transfer would still execute.
+	if err := decoder.Decode(new(struct{})); !errors.Is(err, io.EOF) {
+		writeError(w, http.StatusBadRequest, "body must contain exactly one JSON object")
 		return
 	}
 

@@ -26,7 +26,8 @@ func writeServiceError(w http.ResponseWriter, err error) {
 		errors.Is(err, domain.ErrInvalidAmount),
 		errors.Is(err, domain.ErrSameWallet):
 		writeError(w, http.StatusUnprocessableEntity, err.Error())
-	case errors.Is(err, domain.ErrIdempotencyConflict):
+	case errors.Is(err, domain.ErrIdempotencyConflict),
+		errors.Is(err, domain.ErrTransferInProgress):
 		writeError(w, http.StatusConflict, err.Error())
 	default:
 		writeError(w, http.StatusInternalServerError, "internal error")
