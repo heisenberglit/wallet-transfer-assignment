@@ -12,8 +12,6 @@ import (
 	"github.com/heisenberglit/wallet-transfer-assignment/internal/repository"
 )
 
-const stateWriteTimeout = 5 * time.Second
-
 // CreateTransferInput is the service-layer request for a new transfer.
 type CreateTransferInput struct {
 	IdempotencyKey string
@@ -134,21 +132,9 @@ func (s *TransferService) apply(ctx context.Context, transfer *domain.Transfer, 
 		return transfer, nil
 
 	case errors.Is(err, domain.ErrInsufficientFunds):
-		// Detached and bounded: the debit is already rolled back, so if the
-		// client disconnects in this gap the row would otherwise stay PENDING
-		// and a later retry could execute the transfer once funds arrive,
-		// instead of replaying the original failure.
-		failCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), stateWriteTimeout)
-		defer cancel()
-
-		updateErr := s.transfers.UpdateState(failCtx, transfer.ID, domain.TransferPending, domain.TransferFailed)
-		if errors.Is(updateErr, domain.ErrInvalidStateTransition) {
-			return s.outcomeOf(ctx, key, updateErr)
-		}
-		if updateErr != nil {
-			slog.Error("transfer state update to FAILED failed", "transfer_id", transfer.ID, "error", updateErr)
-			return nil, updateErr
-		}
+		// Execute already committed the FAILED state in the same transaction
+		// that declined to move the money, so there is no second write here to
+		// lose if this request is cancelled.
 		slog.Warn("transfer failed: insufficient funds", "transfer_id", transfer.ID, "idempotency_key", key)
 		transfer.State = domain.TransferFailed
 		return transfer, domain.ErrInsufficientFunds

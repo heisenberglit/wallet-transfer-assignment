@@ -277,8 +277,59 @@ func TestTransferExecutor_Execute_InsufficientFunds(t *testing.T) {
 	require.NoError(t, err)
 	assert.EqualValues(t, 10, fromWallet.Balance, "balance must be untouched on a failed debit")
 
+	toWallet, err := wallets.Get(ctx, toID)
+	require.NoError(t, err)
+	assert.EqualValues(t, 0, toWallet.Balance, "a credit applied before the debit failed must be rolled back")
+
 	assert.Empty(t, ledgerEntriesFor(t, pool, fromID), "no ledger rows should be written on a failed debit")
-	assert.Equal(t, domain.TransferPending, transferState(t, pool, transfer.ID))
+
+	// The failure is committed by Execute itself, in the same transaction that
+	// declined to move the money — not by a second write afterwards that a
+	// crash or a cancelled request could lose.
+	assert.Equal(t, domain.TransferFailed, transferState(t, pool, transfer.ID),
+		"Execute must durably record FAILED before returning")
+}
+
+// The credit sorts first whenever the destination wallet id is the lower of
+// the two, so a failing debit has to undo a credit that already applied. This
+// forces that ordering explicitly rather than leaving it to random UUIDs.
+func TestTransferExecutor_Execute_InsufficientFundsWhenCreditSortsFirst(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+
+	// "aaa_" sorts before "zzz_", so the destination is updated first.
+	fromID, toID := "zzz_"+uuid.NewString(), "aaa_"+uuid.NewString()
+	_, err := pool.Exec(ctx, `INSERT INTO wallets (id, balance) VALUES ($1, 10), ($2, 500)`, fromID, toID)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		pool.Exec(ctx, `DELETE FROM ledger_entries WHERE wallet_id IN ($1,$2)`, fromID, toID)                            //nolint:errcheck
+		pool.Exec(ctx, `DELETE FROM transfers WHERE from_wallet_id IN ($1,$2) OR to_wallet_id IN ($1,$2)`, fromID, toID) //nolint:errcheck
+		pool.Exec(ctx, `DELETE FROM wallets WHERE id IN ($1,$2)`, fromID, toID)                                          //nolint:errcheck
+	})
+
+	transfers := postgres.NewTransferRepository(pool)
+	wallets := postgres.NewWalletRepository(pool)
+	executor := postgres.NewTransferExecutor(pool)
+
+	transfer := newPendingTransfer(fromID, toID, 100)
+	require.NoError(t, transfers.Create(ctx, transfer))
+
+	debit := domain.LedgerEntry{ID: uuid.NewString(), WalletID: fromID, TransferID: transfer.ID, Type: domain.LedgerDebit, Amount: 100, CreatedAt: time.Now()}
+	credit := domain.LedgerEntry{ID: uuid.NewString(), WalletID: toID, TransferID: transfer.ID, Type: domain.LedgerCredit, Amount: 100, CreatedAt: time.Now()}
+
+	require.Less(t, toID, fromID, "this test only means anything if the credit sorts first")
+	assert.ErrorIs(t, executor.Execute(ctx, transfer, debit, credit), domain.ErrInsufficientFunds)
+
+	fromWallet, err := wallets.Get(ctx, fromID)
+	require.NoError(t, err)
+	assert.EqualValues(t, 10, fromWallet.Balance)
+
+	toWallet, err := wallets.Get(ctx, toID)
+	require.NoError(t, err)
+	assert.EqualValues(t, 500, toWallet.Balance, "the already-applied credit must be undone")
+
+	assert.Empty(t, ledgerEntriesFor(t, pool, toID))
+	assert.Equal(t, domain.TransferFailed, transferState(t, pool, transfer.ID))
 }
 
 // Proves the concurrency claim: fires many concurrent debits at one wallet and checks the final balance.

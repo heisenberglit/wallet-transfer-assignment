@@ -103,7 +103,10 @@ not an unconditional write, so a second call against an already-`PROCESSED`
 transfer fails loudly instead of re-applying the debit/credit. That CAS is
 also what makes resuming a stranded transfer safe: if two callers execute
 the same transfer at once, one commits and the other's CAS matches nothing,
-rolling its whole transaction back.
+rolling its whole transaction back. `TransferState.CanTransitionTo` states
+the rule in the domain — only `PENDING` moves, and only to a terminal state
+— so no repository call can walk a transfer backwards into `PENDING` and make
+it eligible for resuming again.
 
 Both ledger entries are checked against the transfer before the transaction
 opens — type, transfer id, wallet ids *and* amounts. The balance updates are
@@ -180,10 +183,14 @@ in that gap leaves a row with no outcome. A retry of the same key resumes it
 rather than reporting it permanently in progress. If the original caller is
 in fact still running, the state CAS above means exactly one of them commits.
 
-The `PENDING → FAILED` write after an insufficient-funds rollback runs on a
-detached, bounded context. On the request context it would be cancelled by a
-client disconnect, leaving the row `PENDING` — and a later retry would then
-execute the transfer once funds arrived instead of replaying the failure.
+**A failed transfer records its failure atomically.** The wallet updates run
+inside a savepoint, so when the debit is declined `Execute` rolls back to it
+— undoing the credit if that leg sorted first — then marks the transfer
+`FAILED` and commits, all in the transaction that declined to move the money.
+An earlier version wrote `FAILED` in a *second* statement after `Execute`
+returned; a crash or a cancelled request in that gap left the row `PENDING`,
+and a later retry would then execute the transfer once funds had arrived
+instead of replaying the original failure.
 
 ### `GET /healthz`
 
@@ -205,9 +212,14 @@ go build ./...
 
 ## How to Run
 
+There is no dotenv loader — the server reads plain environment variables —
+so `.env.example` is a reference to copy values from, not a file that is
+read at startup. Export them, or pass them inline as below.
+
 ```bash
-cp .env.example .env
-make up             # starts Postgres on localhost:5432
+export DATABASE_URL="postgres://postgres:postgres@localhost:5432/wallet_transfer?sslmode=disable"
+
+make up             # starts Postgres on localhost:5432, waits for healthy
 make migrate-up      # applies migrations/0001_init.up.sql
 make seed            # seeds wallet_1 (1000), wallet_2 (500), wallet_3 (0) — scripts/seed.sql
 go run ./cmd/server
@@ -217,9 +229,11 @@ go run ./cmd/server
 ledger rows and idempotency keys for those three wallets before restoring
 their balances, so state can't disagree with the ledger and an old key can't
 replay. If it finds a transfer with one leg *outside* the seeded set it
-refuses rather than corrupting that wallet's balance, and tells you to start
-from a clean database. There's no wallet-creation API yet (see Known
-Limitations), so this script is the only way to get a wallet to test against.
+refuses rather than corrupting that wallet's balance. **Stop the service
+first** — nothing coordinates the reset with a live `TransferExecutor`, so a
+transfer committing alongside it could land on top of the reset state.
+There's no wallet-creation API yet (see Known Limitations), so this script is
+the only way to get a wallet to test against.
 
 ```bash
 curl -X POST http://localhost:8080/transfers \
@@ -233,7 +247,7 @@ curl -X POST http://localhost:8080/transfers \
 go test ./...                    # unit tests only; Postgres tests self-skip
 ```
 
-**67 tests.** Two kinds:
+**68 tests** (43 top-level, 25 subtests). Two kinds:
 
 - **Unit tests** — no database, using hand-rolled fakes.
   `internal/service/transfer_service_test.go` covers validation, every

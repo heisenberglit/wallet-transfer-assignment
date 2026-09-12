@@ -11,6 +11,10 @@ const (
 	TransferFailed    TransferState = "FAILED"
 )
 
+func (s TransferState) CanTransitionTo(next TransferState) bool {
+	return s == TransferPending && (next == TransferProcessed || next == TransferFailed)
+}
+
 type Transfer struct {
 	ID             string
 	IdempotencyKey string

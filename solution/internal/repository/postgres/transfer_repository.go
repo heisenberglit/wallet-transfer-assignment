@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -31,7 +32,10 @@ func (r *TransferRepository) Create(ctx context.Context, t *domain.Transfer) err
 	switch {
 	case err == nil:
 		return nil
-	case isUniqueViolation(err):
+	// Only the idempotency-key constraint means "someone else got here first".
+	// A clash on the primary key is a genuine integrity error and must not be
+	// dressed up as a 409.
+	case isUniqueViolationOn(err, "transfers_idempotency_key_key"):
 		return domain.ErrIdempotencyConflict
 	case isForeignKeyViolation(err):
 		return domain.ErrWalletNotFound
@@ -60,6 +64,10 @@ func (r *TransferRepository) GetByIdempotencyKey(ctx context.Context, key string
 }
 
 func (r *TransferRepository) UpdateState(ctx context.Context, id string, from, to domain.TransferState) error {
+	if !from.CanTransitionTo(to) {
+		return fmt.Errorf("%w: %s -> %s", domain.ErrInvalidStateTransition, from, to)
+	}
+
 	const query = `UPDATE transfers SET state = $3, updated_at = now() WHERE id = $1 AND state = $2`
 
 	tag, err := r.pool.Exec(ctx, query, id, from, to)

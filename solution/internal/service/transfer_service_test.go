@@ -29,7 +29,6 @@ func walletFound(_ context.Context, id string) (*domain.Wallet, error) {
 type fakeTransfers struct {
 	create              func(ctx context.Context, t *domain.Transfer) error
 	getByIdempotencyKey func(ctx context.Context, key string) (*domain.Transfer, error)
-	updateState         func(ctx context.Context, id string, from, to domain.TransferState) error
 }
 
 func (f *fakeTransfers) Create(ctx context.Context, t *domain.Transfer) error {
@@ -43,12 +42,6 @@ func (f *fakeTransfers) GetByIdempotencyKey(ctx context.Context, key string) (*d
 		return nil, nil
 	}
 	return f.getByIdempotencyKey(ctx, key)
-}
-func (f *fakeTransfers) UpdateState(ctx context.Context, id string, from, to domain.TransferState) error {
-	if f.updateState == nil {
-		return nil
-	}
-	return f.updateState(ctx, id, from, to)
 }
 
 type fakeExecutor struct {
@@ -202,29 +195,17 @@ func TestCreateTransfer_RaceLostToFailedTransferReturnsOriginalError(t *testing.
 	assert.Same(t, failed, got)
 }
 
-// The debit is already rolled back by the time the PENDING -> FAILED write
-// runs, so that write must not ride on the request context: if the client
-// disconnects in the gap the row would stay PENDING, and a later retry would
-// execute the transfer (once funds arrive) instead of replaying the failure.
-func TestCreateTransfer_FailedTransitionSurvivesClientDisconnect(t *testing.T) {
+// Recording the failure is now part of Execute's own transaction, so the
+// service must not make a second state write that a cancelled request could
+// lose. Cancelling mid-flight must not change the reported outcome.
+func TestCreateTransfer_InsufficientFundsNeedsNoSecondWrite(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 
-	var updateCtxErr error
-	var updated bool
 	svc := service.NewTransferService(
 		&fakeWallets{get: walletFound},
-		&fakeTransfers{
-			updateState: func(updateCtx context.Context, _ string, from, to domain.TransferState) error {
-				updated = true
-				updateCtxErr = updateCtx.Err() // must not already be canceled
-				assert.Equal(t, domain.TransferPending, from)
-				assert.Equal(t, domain.TransferFailed, to)
-				return nil
-			},
-		},
+		&fakeTransfers{},
 		&fakeExecutor{execute: func(context.Context, *domain.Transfer, domain.LedgerEntry, domain.LedgerEntry) error {
-			// The client goes away exactly as the debit is rejected.
-			cancel()
+			cancel() // the client goes away exactly as the debit is declined
 			return domain.ErrInsufficientFunds
 		}},
 	)
@@ -234,9 +215,6 @@ func TestCreateTransfer_FailedTransitionSurvivesClientDisconnect(t *testing.T) {
 	assert.ErrorIs(t, err, domain.ErrInsufficientFunds)
 	require.NotNil(t, got)
 	assert.Equal(t, domain.TransferFailed, got.State)
-	require.True(t, updated, "the FAILED transition must still be attempted")
-	assert.NoError(t, updateCtxErr,
-		"the FAILED write must run on a context detached from the canceled request")
 }
 
 // A transfer created but never executed (its caller crashed in the gap) must
@@ -420,18 +398,9 @@ func TestCreateTransfer_Success(t *testing.T) {
 }
 
 func TestCreateTransfer_InsufficientFunds(t *testing.T) {
-	var failedStateSet bool
-
 	svc := service.NewTransferService(
 		&fakeWallets{get: walletFound},
-		&fakeTransfers{
-			updateState: func(_ context.Context, _ string, from, to domain.TransferState) error {
-				assert.Equal(t, domain.TransferPending, from, "must be a guarded PENDING -> FAILED transition")
-				assert.Equal(t, domain.TransferFailed, to)
-				failedStateSet = true
-				return nil
-			},
-		},
+		&fakeTransfers{},
 		&fakeExecutor{execute: func(context.Context, *domain.Transfer, domain.LedgerEntry, domain.LedgerEntry) error {
 			return domain.ErrInsufficientFunds
 		}},
@@ -441,7 +410,6 @@ func TestCreateTransfer_InsufficientFunds(t *testing.T) {
 	assert.ErrorIs(t, err, domain.ErrInsufficientFunds)
 	require.NotNil(t, got)
 	assert.Equal(t, domain.TransferFailed, got.State)
-	assert.True(t, failedStateSet)
 }
 
 func TestCreateTransfer_IdempotencyConflictRace(t *testing.T) {

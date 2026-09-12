@@ -7,7 +7,9 @@ CREATE TABLE wallets (
 
 CREATE TABLE transfers (
     id               UUID PRIMARY KEY,
-    idempotency_key  TEXT NOT NULL UNIQUE,
+    -- Named explicitly: the repository matches on this constraint name to tell
+    -- an idempotency clash apart from any other unique violation.
+    idempotency_key  TEXT NOT NULL CONSTRAINT transfers_idempotency_key_key UNIQUE,
     request_hash     TEXT NOT NULL,
     from_wallet_id   TEXT NOT NULL REFERENCES wallets (id),
     to_wallet_id     TEXT NOT NULL REFERENCES wallets (id),

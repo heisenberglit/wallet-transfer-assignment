@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -58,14 +59,43 @@ func (e *TransferExecutor) Execute(ctx context.Context, transfer *domain.Transfe
 		_ = tx.Rollback(rollbackCtx)
 	}()
 
+	// The wallet updates go inside a savepoint so that insufficient funds can
+	// be undone without losing the outer transaction. That lets the FAILED
+	// state be recorded in the *same* transaction that declined to move the
+	// money, instead of a second write afterwards that a crash could lose.
+	moved, err := tx.Begin(ctx)
+	if err != nil {
+		return err
+	}
+
 	first, second := debitWallet, creditWallet
 	if transfer.FromWalletID > transfer.ToWalletID {
 		first, second = creditWallet, debitWallet
 	}
-	if err := first(ctx, tx, transfer); err != nil {
-		return err
+
+	moveErr := first(ctx, moved, transfer)
+	if moveErr == nil {
+		moveErr = second(ctx, moved, transfer)
 	}
-	if err := second(ctx, tx, transfer); err != nil {
+
+	if errors.Is(moveErr, domain.ErrInsufficientFunds) {
+		// Undo the leg that may already have applied (when the credit sorts
+		// first), then mark the transfer FAILED and commit that decision.
+		if err := moved.Rollback(ctx); err != nil {
+			return err
+		}
+		if err := setState(ctx, tx, transfer, domain.TransferFailed); err != nil {
+			return err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return err
+		}
+		return domain.ErrInsufficientFunds
+	}
+	if moveErr != nil {
+		return moveErr
+	}
+	if err := moved.Commit(ctx); err != nil {
 		return err
 	}
 
@@ -79,17 +109,26 @@ func (e *TransferExecutor) Execute(ctx context.Context, transfer *domain.Transfe
 		}
 	}
 
+	if err := setState(ctx, tx, transfer, domain.TransferProcessed); err != nil {
+		return err
+	}
+
+	return tx.Commit(ctx)
+}
+
+// setState is the compare-and-swap out of PENDING. Zero rows means someone
+// else already moved this transfer, so this attempt must not apply.
+func setState(ctx context.Context, tx pgx.Tx, transfer *domain.Transfer, to domain.TransferState) error {
 	tag, err := tx.Exec(ctx,
 		`UPDATE transfers SET state = $3, updated_at = now() WHERE id = $1 AND state = $2`,
-		transfer.ID, domain.TransferPending, domain.TransferProcessed)
+		transfer.ID, domain.TransferPending, to)
 	if err != nil {
 		return err
 	}
 	if tag.RowsAffected() == 0 {
 		return domain.ErrInvalidStateTransition
 	}
-
-	return tx.Commit(ctx)
+	return nil
 }
 
 // checkEntries rejects a debit/credit pair that disagrees with the transfer.
