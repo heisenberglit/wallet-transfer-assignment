@@ -197,23 +197,86 @@ func TestCreateTransfer_RaceLostToFailedTransferReturnsOriginalError(t *testing.
 	assert.Same(t, failed, got)
 }
 
-// A replay that finds the winner still PENDING must not be reported as a
-// success: the winner may yet fail, so its outcome is simply not known.
-func TestCreateTransfer_ReplayOfPendingTransferIsNotASuccess(t *testing.T) {
-	pending := &domain.Transfer{ID: "pending-id", IdempotencyKey: "key-1", State: domain.TransferPending}
+// A transfer created but never executed (its caller crashed in the gap) must
+// be carried to a terminal state by the next retry of the same key, not left
+// stranded in progress forever.
+func TestCreateTransfer_ResumesAPendingTransfer(t *testing.T) {
+	pending := &domain.Transfer{
+		ID: "pending-id", IdempotencyKey: "key-1", FromWalletID: "wallet_1",
+		ToWalletID: "wallet_2", Amount: 100, State: domain.TransferPending,
+	}
 
+	var executed bool
 	svc := service.NewTransferService(
 		&fakeWallets{get: walletFound},
 		&fakeTransfers{
 			getByIdempotencyKey: func(context.Context, string) (*domain.Transfer, error) { return pending, nil },
 			create: func(context.Context, *domain.Transfer) error {
-				t.Fatal("Create should not be called on an idempotency replay")
+				t.Fatal("Create must not be called for a key that already exists")
 				return nil
 			},
 		},
-		&fakeExecutor{execute: func(context.Context, *domain.Transfer, domain.LedgerEntry, domain.LedgerEntry) error {
-			t.Fatal("Execute should not be called on an idempotency replay")
+		&fakeExecutor{execute: func(_ context.Context, transfer *domain.Transfer, debit, credit domain.LedgerEntry) error {
+			executed = true
+			assert.Equal(t, "pending-id", transfer.ID, "must resume the existing transfer, not a new one")
+			assert.Equal(t, "wallet_1", debit.WalletID)
+			assert.Equal(t, "wallet_2", credit.WalletID)
+			assert.EqualValues(t, 100, debit.Amount)
 			return nil
+		}},
+	)
+
+	got, err := svc.CreateTransfer(context.Background(), validInput())
+	require.NoError(t, err)
+	require.True(t, executed, "the pending transfer must actually be executed")
+	assert.Equal(t, domain.TransferProcessed, got.State)
+}
+
+// If a concurrent execution of the same transfer commits first, this caller's
+// attempt loses the state CAS and must report the winner's outcome.
+func TestCreateTransfer_ResumeLosingTheRaceReportsTheWinnersOutcome(t *testing.T) {
+	pending := &domain.Transfer{
+		ID: "pending-id", IdempotencyKey: "key-1", FromWalletID: "wallet_1",
+		ToWalletID: "wallet_2", Amount: 100, State: domain.TransferPending,
+	}
+	processed := &domain.Transfer{ID: "pending-id", IdempotencyKey: "key-1", State: domain.TransferProcessed}
+
+	lookups := 0
+	svc := service.NewTransferService(
+		&fakeWallets{get: walletFound},
+		&fakeTransfers{
+			getByIdempotencyKey: func(context.Context, string) (*domain.Transfer, error) {
+				lookups++
+				if lookups == 1 {
+					return pending, nil
+				}
+				return processed, nil // the winner finished in the meantime
+			},
+		},
+		&fakeExecutor{execute: func(context.Context, *domain.Transfer, domain.LedgerEntry, domain.LedgerEntry) error {
+			return domain.ErrInvalidStateTransition
+		}},
+	)
+
+	got, err := svc.CreateTransfer(context.Background(), validInput())
+	require.NoError(t, err)
+	assert.Same(t, processed, got)
+}
+
+// A resume that still cannot reach a terminal state must not look successful.
+func TestCreateTransfer_ResumeStillInProgressIsNotASuccess(t *testing.T) {
+	pending := &domain.Transfer{
+		ID: "pending-id", IdempotencyKey: "key-1", FromWalletID: "wallet_1",
+		ToWalletID: "wallet_2", Amount: 100, State: domain.TransferPending,
+	}
+
+	svc := service.NewTransferService(
+		&fakeWallets{get: walletFound},
+		&fakeTransfers{
+			getByIdempotencyKey: func(context.Context, string) (*domain.Transfer, error) { return pending, nil },
+		},
+		&fakeExecutor{execute: func(context.Context, *domain.Transfer, domain.LedgerEntry, domain.LedgerEntry) error {
+			return domain.ErrInvalidStateTransition
 		}},
 	)
 

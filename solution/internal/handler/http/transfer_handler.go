@@ -11,6 +11,8 @@ import (
 	"github.com/heisenberglit/wallet-transfer-assignment/internal/service"
 )
 
+const maxBodyBytes = 64 << 10 // 64 KiB
+
 // TransferCreator lets handler tests substitute a fake instead of *service.TransferService.
 type TransferCreator interface {
 	CreateTransfer(ctx context.Context, in service.CreateTransferInput) (*domain.Transfer, error)
@@ -29,7 +31,7 @@ func NewTransferHandler(transfers TransferCreator) *TransferHandler {
 // POST /transfers
 func (h *TransferHandler) Create(w http.ResponseWriter, r *http.Request) {
 	var req createTransferRequest
-	decoder := json.NewDecoder(r.Body)
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBodyBytes))
 	if err := decoder.Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return

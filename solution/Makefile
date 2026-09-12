@@ -19,7 +19,7 @@ fmt-check:
 	fi
 
 up:
-	docker compose up -d
+	docker compose up -d --wait
 
 down:
 	docker compose down

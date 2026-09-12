@@ -1,8 +1,3 @@
--- Seed wallets for manual/local testing (there's no wallet-creation API yet).
--- Re-runnable and a true reset: prior transfers, ledger rows and idempotency
--- keys for these wallets are cleared, so balances cannot disagree with the
--- ledger and an old key cannot replay. Local development only.
-
 BEGIN;
 
 DELETE FROM ledger_entries

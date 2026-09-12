@@ -17,9 +17,9 @@ to blindly generate a finished solution in one shot.
 4. Asked it to move the scaffold into a dedicated `solution/` subfolder separate from the template's own docs.
 5. Asked it to add graceful shutdown and request-logging middleware. Separately, asked it to review the repository implementations once real SQL started being written (partly directly in the IDE), which surfaced real bugs: a wrong table name, a missing column, timestamp type mismatches, and a row lock that didn't actually hold across a later write.
 6. Fixing the row-lock bug required threading a transaction through the repositories
-7. Asked for a cleanup pass (removing anything unnecessary), moving `pgerr.go` into a narrowly-scoped `internal/utils` package, adding observability (structured `log/slog` logging throughout), writing real automated tests (unit tests against fakes, plus Postgres integration tests including a concurrency test), and writing a proper `solution/README.md` (architecture, API reference,build/run/test/deploy, pros/cons, known limitations).
+7. Asked for a cleanup pass (removing anything unnecessary), moving `pgerr.go` into a narrowly-scoped `internal/utils` package, adding observability (structured `log/slog` logging throughout), writing real automated tests (unit tests against fakes, plus Postgres integration tests including a concurrency test), and writing a proper `solution/README.md` (architecture, API reference, build/run/test/deploy, pros/cons, known limitations).
 8. Asked for a `scripts/seed.sql` script (re-runnable wallet seed data) plus a `make seed` target, since there's no wallet-creation API.
-9. Asked it to check the actual `evaluation_guide.md` rubric against the real implementation. It gave an honest per-category assessment,including flagging that at that point.
+9. Asked it to check the actual `evaluation_guide.md` rubric against the real implementation. It gave an honest per-category assessment, including flagging the gaps that still existed at that point.
 
 ## 3. Prompts used this session
 

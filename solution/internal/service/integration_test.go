@@ -56,18 +56,21 @@ func TestCreateTransfer_ConcurrentSameIdempotencyKey(t *testing.T) {
 	const concurrency = 20
 	idempotencyKey := "race-" + uuid.NewString()
 
-	start := make(chan struct{})
 	results := make([]struct {
 		id    string
 		state domain.TransferState
 		err   error
 	}, concurrency)
 
-	var wg sync.WaitGroup
+	var ready, done sync.WaitGroup
+	ready.Add(concurrency)
+	done.Add(concurrency)
+	start := make(chan struct{})
+
 	for i := 0; i < concurrency; i++ {
-		wg.Add(1)
 		go func(i int) {
-			defer wg.Done()
+			defer done.Done()
+			ready.Done()
 			<-start
 			transfer, err := svc.CreateTransfer(context.Background(), service.CreateTransferInput{
 				IdempotencyKey: idempotencyKey,
@@ -82,8 +85,9 @@ func TestCreateTransfer_ConcurrentSameIdempotencyKey(t *testing.T) {
 			}
 		}(i)
 	}
+	ready.Wait()
 	close(start)
-	wg.Wait()
+	done.Wait()
 
 	// Every caller must see the same transfer, and none may be told it
 	// succeeded unless it is actually PROCESSED. A caller that observed an
@@ -125,4 +129,61 @@ func TestCreateTransfer_ConcurrentSameIdempotencyKey(t *testing.T) {
 		 WHERE t.idempotency_key = $1`, idempotencyKey).Scan(&debits, &credits))
 	assert.Equal(t, 1, debits, "exactly one debit row")
 	assert.Equal(t, 1, credits, "exactly one credit row")
+}
+
+func TestCreateTransfer_ResumesATransferStrandedInPending(t *testing.T) {
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		t.Skip("DATABASE_URL not set; skipping Postgres integration test")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	pool, err := db.Connect(ctx, dsn)
+	require.NoError(t, err)
+	t.Cleanup(pool.Close)
+
+	bg := context.Background()
+	fromID := "test_" + uuid.NewString()
+	toID := "test_" + uuid.NewString()
+	_, err = pool.Exec(bg, `INSERT INTO wallets (id, balance) VALUES ($1, 1000), ($2, 0)`, fromID, toID)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		pool.Exec(bg, `DELETE FROM ledger_entries WHERE wallet_id IN ($1, $2)`, fromID, toID)                             //nolint:errcheck
+		pool.Exec(bg, `DELETE FROM transfers WHERE from_wallet_id IN ($1, $2) OR to_wallet_id IN ($1, $2)`, fromID, toID) //nolint:errcheck
+		pool.Exec(bg, `DELETE FROM wallets WHERE id IN ($1, $2)`, fromID, toID)                                           //nolint:errcheck
+	})
+
+	wallets := postgres.NewWalletRepository(pool)
+	transfers := postgres.NewTransferRepository(pool)
+	svc := service.NewTransferService(wallets, transfers, postgres.NewTransferExecutor(pool))
+
+	key := "stranded-" + uuid.NewString()
+	strandedID := uuid.NewString()
+	_, err = pool.Exec(bg,
+		`INSERT INTO transfers (id, idempotency_key, from_wallet_id, to_wallet_id, amount, state)
+		 VALUES ($1, $2, $3, $4, 100, 'PENDING')`, strandedID, key, fromID, toID)
+	require.NoError(t, err)
+
+	got, err := svc.CreateTransfer(bg, service.CreateTransferInput{
+		IdempotencyKey: key, FromWalletID: fromID, ToWalletID: toID, Amount: 100,
+	})
+	require.NoError(t, err, "the retry must finish the stranded transfer")
+	assert.Equal(t, strandedID, got.ID, "it must resume the original transfer, not create a new one")
+	assert.Equal(t, domain.TransferProcessed, got.State)
+
+	fromWallet, err := wallets.Get(bg, fromID)
+	require.NoError(t, err)
+	assert.EqualValues(t, 900, fromWallet.Balance)
+
+	toWallet, err := wallets.Get(bg, toID)
+	require.NoError(t, err)
+	assert.EqualValues(t, 100, toWallet.Balance)
+
+	var debits, credits int
+	require.NoError(t, pool.QueryRow(bg,
+		`SELECT count(*) FILTER (WHERE type='DEBIT'), count(*) FILTER (WHERE type='CREDIT')
+		 FROM ledger_entries WHERE transfer_id = $1`, strandedID).Scan(&debits, &credits))
+	assert.Equal(t, 1, debits)
+	assert.Equal(t, 1, credits)
 }

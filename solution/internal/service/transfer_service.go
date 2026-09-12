@@ -44,6 +44,10 @@ func (s *TransferService) CreateTransfer(ctx context.Context, in CreateTransferI
 	} else if existing != nil {
 		slog.Info("transfer idempotency replay", "transfer_id", existing.ID,
 			"idempotency_key", in.IdempotencyKey, "state", existing.State)
+		if existing.State == domain.TransferPending {
+			slog.Info("resuming a pending transfer", "transfer_id", existing.ID)
+			return s.apply(ctx, existing, in.IdempotencyKey)
+		}
 		return replay(existing)
 	}
 
@@ -92,26 +96,52 @@ func (s *TransferService) CreateTransfer(ctx context.Context, in CreateTransferI
 	slog.Info("transfer created", "transfer_id", transfer.ID, "idempotency_key", in.IdempotencyKey,
 		"from_wallet_id", in.FromWalletID, "to_wallet_id", in.ToWalletID, "amount", in.Amount)
 
-	debit := domain.LedgerEntry{ID: uuid.NewString(), WalletID: in.FromWalletID, TransferID: transfer.ID, Type: domain.LedgerDebit, Amount: in.Amount, CreatedAt: now}
-	credit := domain.LedgerEntry{ID: uuid.NewString(), WalletID: in.ToWalletID, TransferID: transfer.ID, Type: domain.LedgerCredit, Amount: in.Amount, CreatedAt: now}
+	return s.apply(ctx, transfer, in.IdempotencyKey)
+}
 
-	if err := s.executor.Execute(ctx, transfer, debit, credit); err != nil {
-		if errors.Is(err, domain.ErrInsufficientFunds) {
-			if updateErr := s.transfers.UpdateState(ctx, transfer.ID, domain.TransferPending, domain.TransferFailed); updateErr != nil {
-				slog.Error("transfer state update to FAILED failed", "transfer_id", transfer.ID, "error", updateErr)
-				return nil, updateErr
-			}
-			slog.Warn("transfer failed: insufficient funds", "transfer_id", transfer.ID, "idempotency_key", in.IdempotencyKey)
-			transfer.State = domain.TransferFailed
-			return transfer, domain.ErrInsufficientFunds
+func (s *TransferService) apply(ctx context.Context, transfer *domain.Transfer, key string) (*domain.Transfer, error) {
+	now := time.Now()
+	debit := domain.LedgerEntry{ID: uuid.NewString(), WalletID: transfer.FromWalletID, TransferID: transfer.ID, Type: domain.LedgerDebit, Amount: transfer.Amount, CreatedAt: now}
+	credit := domain.LedgerEntry{ID: uuid.NewString(), WalletID: transfer.ToWalletID, TransferID: transfer.ID, Type: domain.LedgerCredit, Amount: transfer.Amount, CreatedAt: now}
+
+	err := s.executor.Execute(ctx, transfer, debit, credit)
+	switch {
+	case err == nil:
+		slog.Info("transfer processed", "transfer_id", transfer.ID, "idempotency_key", key)
+		transfer.State = domain.TransferProcessed
+		return transfer, nil
+
+	case errors.Is(err, domain.ErrInsufficientFunds):
+		updateErr := s.transfers.UpdateState(ctx, transfer.ID, domain.TransferPending, domain.TransferFailed)
+		if errors.Is(updateErr, domain.ErrInvalidStateTransition) {
+			return s.outcomeOf(ctx, key, updateErr)
 		}
+		if updateErr != nil {
+			slog.Error("transfer state update to FAILED failed", "transfer_id", transfer.ID, "error", updateErr)
+			return nil, updateErr
+		}
+		slog.Warn("transfer failed: insufficient funds", "transfer_id", transfer.ID, "idempotency_key", key)
+		transfer.State = domain.TransferFailed
+		return transfer, domain.ErrInsufficientFunds
+
+	case errors.Is(err, domain.ErrInvalidStateTransition):
+		return s.outcomeOf(ctx, key, err)
+
+	default:
 		slog.Error("transfer execute failed", "transfer_id", transfer.ID, "error", err)
 		return nil, err
 	}
+}
 
-	slog.Info("transfer processed", "transfer_id", transfer.ID, "idempotency_key", in.IdempotencyKey)
-	transfer.State = domain.TransferProcessed
-	return transfer, nil
+func (s *TransferService) outcomeOf(ctx context.Context, key string, cause error) (*domain.Transfer, error) {
+	current, err := s.transfers.GetByIdempotencyKey(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	if current == nil {
+		return nil, cause
+	}
+	return replay(current)
 }
 
 // replay reproduces the original outcome for an already-seen idempotency key,

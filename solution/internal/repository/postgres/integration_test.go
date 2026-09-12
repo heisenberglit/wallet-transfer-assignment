@@ -48,9 +48,19 @@ func seedWallets(t *testing.T, pool *pgxpool.Pool, fromBalance, toBalance int64)
 	require.NoError(t, err)
 
 	t.Cleanup(func() {
-		pool.Exec(context.Background(), `DELETE FROM ledger_entries WHERE wallet_id IN ($1, $2)`, fromID, toID)                             //nolint:errcheck
-		pool.Exec(context.Background(), `DELETE FROM transfers WHERE from_wallet_id IN ($1, $2) OR to_wallet_id IN ($1, $2)`, fromID, toID) //nolint:errcheck
-		pool.Exec(context.Background(), `DELETE FROM wallets WHERE id IN ($1, $2)`, fromID, toID)                                           //nolint:errcheck
+		bg := context.Background()
+		steps := []string{
+			`DELETE FROM ledger_entries WHERE transfer_id IN (
+				SELECT id FROM transfers WHERE from_wallet_id IN ($1, $2) OR to_wallet_id IN ($1, $2))`,
+			`DELETE FROM ledger_entries WHERE wallet_id IN ($1, $2)`,
+			`DELETE FROM transfers WHERE from_wallet_id IN ($1, $2) OR to_wallet_id IN ($1, $2)`,
+			`DELETE FROM wallets WHERE id IN ($1, $2)`,
+		}
+		for _, step := range steps {
+			if _, err := pool.Exec(bg, step, fromID, toID); err != nil {
+				t.Errorf("cleanup failed (test rows leaked): %v", err)
+			}
+		}
 	})
 
 	return fromID, toID
@@ -84,6 +94,29 @@ func transferState(t *testing.T, pool *pgxpool.Pool, id string) domain.TransferS
 	require.NoError(t, pool.QueryRow(context.Background(),
 		`SELECT state FROM transfers WHERE id = $1`, id).Scan(&state))
 	return state
+}
+
+func runConcurrently(n int, worker func(i int) (action func())) {
+	var ready, done sync.WaitGroup
+	ready.Add(n)
+	done.Add(n)
+	start := make(chan struct{})
+
+	for i := 0; i < n; i++ {
+		go func(i int) {
+			defer done.Done()
+			action := worker(i)
+			ready.Done()
+			<-start
+			if action != nil {
+				action()
+			}
+		}(i)
+	}
+
+	ready.Wait()
+	close(start)
+	done.Wait()
 }
 
 func newPendingTransfer(fromID, toID string, amount int64) *domain.Transfer {
@@ -261,30 +294,19 @@ func TestTransferExecutor_Execute_ConcurrentDebits(t *testing.T) {
 	executor := postgres.NewTransferExecutor(pool)
 	ctx := context.Background()
 
-	var wg sync.WaitGroup
 	var succeeded, insufficientFunds int64
 
-	// Setup happens before the barrier so that every worker is released into
-	// Execute at once. Without it the scheduler can serialize the statements
-	// and even a read-then-write implementation reaches the right balance.
-	start := make(chan struct{})
+	runConcurrently(attempts, func(int) func() {
+		transfer := newPendingTransfer(fromID, toID, perTransfer)
+		if err := transfers.Create(ctx, transfer); err != nil {
+			t.Errorf("transfers.Create: %v", err)
+			return nil
+		}
 
-	for i := 0; i < attempts; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		debit := domain.LedgerEntry{ID: uuid.NewString(), WalletID: fromID, TransferID: transfer.ID, Type: domain.LedgerDebit, Amount: perTransfer, CreatedAt: time.Now()}
+		credit := domain.LedgerEntry{ID: uuid.NewString(), WalletID: toID, TransferID: transfer.ID, Type: domain.LedgerCredit, Amount: perTransfer, CreatedAt: time.Now()}
 
-			transfer := newPendingTransfer(fromID, toID, perTransfer)
-			if err := transfers.Create(ctx, transfer); err != nil {
-				t.Errorf("transfers.Create: %v", err)
-				return
-			}
-
-			debit := domain.LedgerEntry{ID: uuid.NewString(), WalletID: fromID, TransferID: transfer.ID, Type: domain.LedgerDebit, Amount: perTransfer, CreatedAt: time.Now()}
-			credit := domain.LedgerEntry{ID: uuid.NewString(), WalletID: toID, TransferID: transfer.ID, Type: domain.LedgerCredit, Amount: perTransfer, CreatedAt: time.Now()}
-
-			<-start
-
+		return func() {
 			switch err := executor.Execute(ctx, transfer, debit, credit); {
 			case err == nil:
 				atomic.AddInt64(&succeeded, 1)
@@ -293,10 +315,8 @@ func TestTransferExecutor_Execute_ConcurrentDebits(t *testing.T) {
 			default:
 				t.Errorf("executor.Execute: unexpected error: %v", err)
 			}
-		}()
-	}
-	close(start)
-	wg.Wait()
+		}
+	})
 
 	assert.EqualValues(t, startingBalance/perTransfer, succeeded, "exactly the number the balance can cover should succeed")
 	assert.EqualValues(t, attempts-startingBalance/perTransfer, insufficientFunds)
@@ -323,32 +343,26 @@ func TestTransferExecutor_Execute_OppositeDirectionDeadlock(t *testing.T) {
 	executor := postgres.NewTransferExecutor(pool)
 	ctx := context.Background()
 
-	start := make(chan struct{})
-	var wg sync.WaitGroup
+	runConcurrently(perSide*2, func(i int) func() {
+		from, to := walletA, walletB
+		if i%2 == 1 {
+			from, to = walletB, walletA
+		}
 
-	fire := func(from, to string) {
-		defer wg.Done()
 		transfer := newPendingTransfer(from, to, perTransfer)
 		if err := transfers.Create(ctx, transfer); err != nil {
 			t.Errorf("transfers.Create: %v", err)
-			return
+			return nil
 		}
 		debit := domain.LedgerEntry{ID: uuid.NewString(), WalletID: from, TransferID: transfer.ID, Type: domain.LedgerDebit, Amount: perTransfer, CreatedAt: time.Now()}
 		credit := domain.LedgerEntry{ID: uuid.NewString(), WalletID: to, TransferID: transfer.ID, Type: domain.LedgerCredit, Amount: perTransfer, CreatedAt: time.Now()}
 
-		<-start
-		if err := executor.Execute(ctx, transfer, debit, credit); err != nil {
-			t.Errorf("executor.Execute (from=%s to=%s): %v", from, to, err)
+		return func() {
+			if err := executor.Execute(ctx, transfer, debit, credit); err != nil {
+				t.Errorf("executor.Execute (from=%s to=%s): %v", from, to, err)
+			}
 		}
-	}
-
-	for i := 0; i < perSide; i++ {
-		wg.Add(2)
-		go fire(walletA, walletB)
-		go fire(walletB, walletA)
-	}
-	close(start)
-	wg.Wait()
+	})
 
 	balA, err := wallets.Get(ctx, walletA)
 	require.NoError(t, err)
@@ -532,33 +546,25 @@ func TestTransferExecutor_Execute_ThreeWayCircularConcurrent(t *testing.T) {
 	wallets := postgres.NewWalletRepository(pool)
 	executor := postgres.NewTransferExecutor(pool)
 
-	start := make(chan struct{})
-	var wg sync.WaitGroup
+	legs := [][2]string{{walletA, walletB}, {walletB, walletC}, {walletC, walletA}}
 
-	fire := func(from, to string) {
-		defer wg.Done()
+	runConcurrently(perLeg*len(legs), func(i int) func() {
+		from, to := legs[i%len(legs)][0], legs[i%len(legs)][1]
+
 		transfer := newPendingTransfer(from, to, perTransfer)
 		if err := transfers.Create(ctx, transfer); err != nil {
 			t.Errorf("transfers.Create: %v", err)
-			return
+			return nil
 		}
 		debit := domain.LedgerEntry{ID: uuid.NewString(), WalletID: from, TransferID: transfer.ID, Type: domain.LedgerDebit, Amount: perTransfer, CreatedAt: time.Now()}
 		credit := domain.LedgerEntry{ID: uuid.NewString(), WalletID: to, TransferID: transfer.ID, Type: domain.LedgerCredit, Amount: perTransfer, CreatedAt: time.Now()}
 
-		<-start
-		if err := executor.Execute(ctx, transfer, debit, credit); err != nil {
-			t.Errorf("executor.Execute (from=%s to=%s): %v", from, to, err)
+		return func() {
+			if err := executor.Execute(ctx, transfer, debit, credit); err != nil {
+				t.Errorf("executor.Execute (from=%s to=%s): %v", from, to, err)
+			}
 		}
-	}
-
-	for i := 0; i < perLeg; i++ {
-		wg.Add(3)
-		go fire(walletA, walletB)
-		go fire(walletB, walletC)
-		go fire(walletC, walletA)
-	}
-	close(start)
-	wg.Wait()
+	})
 
 	// Every wallet sends perLeg*perTransfer and receives perLeg*perTransfer,
 	// so each nets to its starting balance.
