@@ -31,7 +31,6 @@ func testPool(t *testing.T) *pgxpool.Pool {
 
 	pool, err := db.Connect(ctx, dsn)
 	require.NoError(t, err)
-	require.NoError(t, pool.Ping(ctx))
 
 	t.Cleanup(pool.Close)
 	return pool

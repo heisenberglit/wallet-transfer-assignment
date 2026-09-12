@@ -46,7 +46,7 @@ func (e *TransferExecutor) Execute(ctx context.Context, transfer *domain.Transfe
 		return err
 	}
 
-	defer tx.Rollback(context.WithoutCancel(ctx))
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
 
 	first, second := debitWallet, creditWallet
 	if transfer.FromWalletID > transfer.ToWalletID {

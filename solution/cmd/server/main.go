@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -21,6 +22,13 @@ const shutdownTimeout = 10 * time.Second
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
 
+	if err := run(); err != nil {
+		slog.Error("server stopped", "error", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
 	ctx := context.Background()
 
 	dsn := os.Getenv("DATABASE_URL")
@@ -30,8 +38,7 @@ func main() {
 
 	pool, err := db.Connect(ctx, dsn)
 	if err != nil {
-		slog.Error("connect to database", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("connect to database: %w", err)
 	}
 	defer pool.Close()
 
@@ -69,18 +76,17 @@ func main() {
 
 	select {
 	case err := <-serverErr:
-		if err != nil {
-			slog.Error("server error", "error", err)
-			os.Exit(1)
-		}
+		return err
 	case <-notifyCtx.Done():
 		slog.Info("shutdown signal received")
 
-		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownTimeout)
-		defer shutdownCancel()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancel()
 
 		if err := srv.Shutdown(shutdownCtx); err != nil {
-			slog.Error("graceful shutdown failed", "error", err)
+			return fmt.Errorf("graceful shutdown: %w", err)
 		}
 	}
+
+	return nil
 }

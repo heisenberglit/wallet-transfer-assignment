@@ -148,6 +148,22 @@ func TestCreate_ForwardsAmountValidationToService(t *testing.T) {
 	assert.EqualValues(t, -5, creator.gotInput.Amount)
 }
 
+func TestHealthz(t *testing.T) {
+	router := handlerhttp.NewRouter(handlerhttp.NewTransferHandler(&fakeCreator{}))
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	var body map[string]string
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
+	assert.Equal(t, "ok", body["status"])
+
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/healthz", nil))
+	assert.Equal(t, http.StatusMethodNotAllowed, rec.Code)
+}
+
 func TestRouter_RejectsWrongMethodAndUnknownPath(t *testing.T) {
 	router := handlerhttp.NewRouter(handlerhttp.NewTransferHandler(&fakeCreator{}))
 

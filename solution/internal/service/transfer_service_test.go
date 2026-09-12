@@ -107,7 +107,7 @@ func TestCreateTransfer_SameWallet(t *testing.T) {
 
 func TestCreateTransfer_WalletNotFound(t *testing.T) {
 	svc := service.NewTransferService(
-		&fakeWallets{get: func(_ context.Context, id string) (*domain.Wallet, error) {
+		&fakeWallets{get: func(_ context.Context, _ string) (*domain.Wallet, error) {
 			return nil, domain.ErrWalletNotFound
 		}},
 		&fakeTransfers{},
@@ -228,7 +228,7 @@ func TestCreateTransfer_InsufficientFunds(t *testing.T) {
 	svc := service.NewTransferService(
 		&fakeWallets{get: walletFound},
 		&fakeTransfers{
-			updateState: func(_ context.Context, id string, state domain.TransferState) error {
+			updateState: func(_ context.Context, _ string, state domain.TransferState) error {
 				assert.Equal(t, domain.TransferFailed, state)
 				failedStateSet = true
 				return nil

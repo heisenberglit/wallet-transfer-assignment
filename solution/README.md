@@ -125,6 +125,7 @@ Response (201, both on the first call and on a replayed duplicate):
 
 | Case                                   | Status |
 |-----------------------------------------|--------|
+| `GET /healthz` (process is up)          | 200    |
 | Success                                 | 201    |
 | Replayed duplicate of a *processed* transfer | 201, identical body to the original |
 | Replayed duplicate of a *failed* transfer | 422, identical to the original response |
@@ -138,6 +139,15 @@ version returned `201 {"state":"FAILED"}` when a failed transfer's key was
 retried, which told a retrying client the money had moved when it never
 had; `replay()` in `transfer_service.go` now re-raises the original error,
 pinned by tests at both the service and handler layers.
+
+### `GET /healthz`
+
+Returns `200 {"status":"ok"}` while the process is up and serving. It
+deliberately does not check the database: a dependency being down is not
+a reason for an orchestrator to restart an otherwise healthy process.
+Because of that it is a liveness signal only — it will keep returning 200
+with an unreachable database. What catches that case here is startup (see
+Deploy), not this endpoint.
 
 There is currently no endpoint to create a wallet or read a balance —
 see Known Limitations below.
@@ -239,10 +249,21 @@ it drops into whatever secrets/config mechanism the target platform
 already has. This was built and run end-to-end (`docker build`, then the
 container hitting a `docker compose` Postgres) as part of writing it.
 
+Startup fails fast on an unreachable database. `pgxpool` dials lazily, so
+without an explicit check the process would bind its port, log
+`listening`, and then return 500 for every request with nothing behind
+it. `db.Connect` pings (capped at 5s) and returns the error, which
+`run()` turns into a non-zero exit — so a container that comes up with no
+database crashes instead of pretending to be healthy.
+
+`GET /healthz` gives an orchestrator a liveness signal. Kept deliberately
+simple for the scope of this assignment: a readiness probe that reports
+whether the database is reachable would be the next step, and is what you
+would actually wire a load balancer to.
+
 Not included, and worth doing before this went anywhere near real
-production traffic: a `/healthz` endpoint for orchestrator liveness
-checks, and running the migration as an explicit release step rather
-than the manual `psql` invocation above.
+production traffic: that readiness probe, and running the migration as an
+explicit release step rather than the manual `psql` invocation above.
 
 ## Pros and Cons of the Key Decisions
 
