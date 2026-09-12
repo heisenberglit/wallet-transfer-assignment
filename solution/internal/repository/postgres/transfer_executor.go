@@ -48,23 +48,15 @@ func (e *TransferExecutor) Execute(ctx context.Context, transfer *domain.Transfe
 
 	defer tx.Rollback(context.WithoutCancel(ctx))
 
-	applyDebit := func() error { return debitWallet(ctx, tx, transfer) }
-	applyCredit := func() error { return creditWallet(ctx, tx, transfer) }
-
-	if transfer.FromWalletID < transfer.ToWalletID {
-		if err := applyDebit(); err != nil {
-			return err
-		}
-		if err := applyCredit(); err != nil {
-			return err
-		}
-	} else {
-		if err := applyCredit(); err != nil {
-			return err
-		}
-		if err := applyDebit(); err != nil {
-			return err
-		}
+	first, second := debitWallet, creditWallet
+	if transfer.FromWalletID > transfer.ToWalletID {
+		first, second = creditWallet, debitWallet
+	}
+	if err := first(ctx, tx, transfer); err != nil {
+		return err
+	}
+	if err := second(ctx, tx, transfer); err != nil {
+		return err
 	}
 
 	const insertLedgerEntry = `

@@ -2,11 +2,9 @@ package domain
 
 import "time"
 
-// Wallet represents a source or destination account that transfers move funds between.
-// Balance is a stored, updated column (not derived from LedgerEntry rows).
 type Wallet struct {
 	ID        string
-	Balance   int64 // smallest currency unit (e.g. cents) to avoid floating point errors
+	Balance   int64 // minor units (e.g. cents) — integer, never floating point
 	CreatedAt time.Time
 	UpdatedAt time.Time
 }

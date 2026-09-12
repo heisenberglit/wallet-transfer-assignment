@@ -2,8 +2,6 @@ package http
 
 import "github.com/heisenberglit/wallet-transfer-assignment/internal/domain"
 
-// Request/response wire types — kept separate from internal/domain, which shouldn't know about HTTP/JSON.
-
 type createTransferRequest struct {
 	IdempotencyKey string `json:"idempotencyKey"`
 	FromWalletID   string `json:"fromWalletId"`

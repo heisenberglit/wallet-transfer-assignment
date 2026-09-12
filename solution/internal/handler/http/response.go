@@ -18,7 +18,6 @@ func writeError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, map[string]string{"error": message})
 }
 
-// writeServiceError maps sentinel domain errors to HTTP status codes.
 func writeServiceError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, domain.ErrWalletNotFound):

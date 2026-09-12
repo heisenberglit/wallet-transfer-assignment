@@ -2,7 +2,6 @@ package service_test
 
 import (
 	"context"
-	"errors"
 	"testing"
 	"time"
 
@@ -22,12 +21,6 @@ type fakeWallets struct {
 func (f *fakeWallets) Get(ctx context.Context, id string) (*domain.Wallet, error) {
 	return f.get(ctx, id)
 }
-func (f *fakeWallets) GetForUpdate(ctx context.Context, id string) (*domain.Wallet, error) {
-	return f.get(ctx, id)
-}
-func (f *fakeWallets) UpdateBalance(ctx context.Context, id string, newBalance int64) error {
-	return nil
-}
 
 func walletFound(_ context.Context, id string) (*domain.Wallet, error) {
 	return &domain.Wallet{ID: id, Balance: 1000}, nil
@@ -44,9 +37,6 @@ func (f *fakeTransfers) Create(ctx context.Context, t *domain.Transfer) error {
 		return nil
 	}
 	return f.create(ctx, t)
-}
-func (f *fakeTransfers) Get(ctx context.Context, id string) (*domain.Transfer, error) {
-	return nil, errors.New("not used in these tests")
 }
 func (f *fakeTransfers) GetByIdempotencyKey(ctx context.Context, key string) (*domain.Transfer, error) {
 	if f.getByIdempotencyKey == nil {
@@ -149,6 +139,62 @@ func TestCreateTransfer_IdempotencyReplay(t *testing.T) {
 	got, err := svc.CreateTransfer(context.Background(), validInput())
 	require.NoError(t, err)
 	assert.Same(t, existing, got)
+}
+
+// A retried key whose original attempt FAILED must reproduce the original
+// outcome — error included. Returning it as a plain success would tell a
+// retrying client the money moved when it never did.
+func TestCreateTransfer_ReplayOfFailedTransferReturnsOriginalError(t *testing.T) {
+	failed := &domain.Transfer{ID: "failed-id", IdempotencyKey: "key-1", State: domain.TransferFailed}
+
+	svc := service.NewTransferService(
+		&fakeWallets{get: walletFound},
+		&fakeTransfers{
+			getByIdempotencyKey: func(context.Context, string) (*domain.Transfer, error) { return failed, nil },
+			create: func(context.Context, *domain.Transfer) error {
+				t.Fatal("Create should not be called on an idempotency replay")
+				return nil
+			},
+		},
+		&fakeExecutor{execute: func(context.Context, *domain.Transfer, domain.LedgerEntry, domain.LedgerEntry) error {
+			t.Fatal("Execute should not be called on an idempotency replay")
+			return nil
+		}},
+	)
+
+	got, err := svc.CreateTransfer(context.Background(), validInput())
+	assert.ErrorIs(t, err, domain.ErrInsufficientFunds)
+	require.NotNil(t, got)
+	assert.Equal(t, domain.TransferFailed, got.State)
+}
+
+// Same rule on the other replay path: losing the concurrent-insert race to a
+// transfer that went on to FAIL must also surface the failure.
+func TestCreateTransfer_RaceLostToFailedTransferReturnsOriginalError(t *testing.T) {
+	failed := &domain.Transfer{ID: "failed-id", IdempotencyKey: "key-1", State: domain.TransferFailed}
+
+	calls := 0
+	svc := service.NewTransferService(
+		&fakeWallets{get: walletFound},
+		&fakeTransfers{
+			getByIdempotencyKey: func(context.Context, string) (*domain.Transfer, error) {
+				calls++
+				if calls == 1 {
+					return nil, nil
+				}
+				return failed, nil
+			},
+			create: func(context.Context, *domain.Transfer) error { return domain.ErrIdempotencyConflict },
+		},
+		&fakeExecutor{execute: func(context.Context, *domain.Transfer, domain.LedgerEntry, domain.LedgerEntry) error {
+			t.Fatal("Execute should not be called when Create lost the idempotency race")
+			return nil
+		}},
+	)
+
+	got, err := svc.CreateTransfer(context.Background(), validInput())
+	assert.ErrorIs(t, err, domain.ErrInsufficientFunds)
+	assert.Same(t, failed, got)
 }
 
 func TestCreateTransfer_Success(t *testing.T) {

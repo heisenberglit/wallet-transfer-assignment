@@ -8,7 +8,6 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/heisenberglit/wallet-transfer-assignment/internal/domain"
-	"github.com/heisenberglit/wallet-transfer-assignment/internal/utils"
 )
 
 // TransferRepository is the pgx-backed implementation of repository.TransferRepository.
@@ -32,28 +31,13 @@ func (r *TransferRepository) Create(ctx context.Context, t *domain.Transfer) err
 	switch {
 	case err == nil:
 		return nil
-	case utils.IsUniqueViolation(err):
+	case isUniqueViolation(err):
 		return domain.ErrIdempotencyConflict
-	case utils.IsForeignKeyViolation(err):
+	case isForeignKeyViolation(err):
 		return domain.ErrWalletNotFound
 	default:
 		return err
 	}
-}
-
-func (r *TransferRepository) Get(ctx context.Context, id string) (*domain.Transfer, error) {
-	const query = `
-		SELECT id, idempotency_key, from_wallet_id, to_wallet_id, amount, state, created_at, updated_at
-		FROM transfers WHERE id = $1`
-
-	t, err := scanTransfer(r.pool.QueryRow(ctx, query, id))
-	if err != nil {
-		return nil, err
-	}
-	if t == nil {
-		return nil, domain.ErrTransferNotFound
-	}
-	return t, nil
 }
 
 // GetByIdempotencyKey returns (nil, nil), not an error, when key is unused.
@@ -62,12 +46,9 @@ func (r *TransferRepository) GetByIdempotencyKey(ctx context.Context, key string
 		SELECT id, idempotency_key, from_wallet_id, to_wallet_id, amount, state, created_at, updated_at
 		FROM transfers WHERE idempotency_key = $1`
 
-	return scanTransfer(r.pool.QueryRow(ctx, query, key))
-}
-
-func scanTransfer(row pgx.Row) (*domain.Transfer, error) {
 	var t domain.Transfer
-	err := row.Scan(&t.ID, &t.IdempotencyKey, &t.FromWalletID, &t.ToWalletID, &t.Amount, &t.State, &t.CreatedAt, &t.UpdatedAt)
+	err := r.pool.QueryRow(ctx, query, key).Scan(
+		&t.ID, &t.IdempotencyKey, &t.FromWalletID, &t.ToWalletID, &t.Amount, &t.State, &t.CreatedAt, &t.UpdatedAt)
 	switch {
 	case err == nil:
 		return &t, nil

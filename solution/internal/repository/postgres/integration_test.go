@@ -57,6 +57,36 @@ func seedWallets(t *testing.T, pool *pgxpool.Pool, fromBalance, toBalance int64)
 	return fromID, toID
 }
 
+// These two read straight from the database rather than through a repository:
+// the point of these tests is what Execute actually wrote, and read code can
+// share a bug with the write code that would hide it.
+
+func ledgerEntriesFor(t *testing.T, pool *pgxpool.Pool, walletID string) []domain.LedgerEntry {
+	t.Helper()
+	rows, err := pool.Query(context.Background(),
+		`SELECT id, wallet_id, transfer_id, type, amount FROM ledger_entries WHERE wallet_id = $1 ORDER BY created_at`,
+		walletID)
+	require.NoError(t, err)
+	defer rows.Close()
+
+	var entries []domain.LedgerEntry
+	for rows.Next() {
+		var e domain.LedgerEntry
+		require.NoError(t, rows.Scan(&e.ID, &e.WalletID, &e.TransferID, &e.Type, &e.Amount))
+		entries = append(entries, e)
+	}
+	require.NoError(t, rows.Err())
+	return entries
+}
+
+func transferState(t *testing.T, pool *pgxpool.Pool, id string) domain.TransferState {
+	t.Helper()
+	var state domain.TransferState
+	require.NoError(t, pool.QueryRow(context.Background(),
+		`SELECT state FROM transfers WHERE id = $1`, id).Scan(&state))
+	return state
+}
+
 func newPendingTransfer(fromID, toID string, amount int64) *domain.Transfer {
 	now := time.Now()
 	return &domain.Transfer{
@@ -80,10 +110,7 @@ func TestTransferRepository_CreateGetAndIdempotencyKeyLookup(t *testing.T) {
 	transfer := newPendingTransfer(fromID, toID, 100)
 	require.NoError(t, repo.Create(ctx, transfer))
 
-	byID, err := repo.Get(ctx, transfer.ID)
-	require.NoError(t, err)
-	assert.Equal(t, transfer.ID, byID.ID)
-	assert.Equal(t, domain.TransferPending, byID.State)
+	assert.Equal(t, domain.TransferPending, transferState(t, pool, transfer.ID))
 
 	byKey, err := repo.GetByIdempotencyKey(ctx, transfer.IdempotencyKey)
 	require.NoError(t, err)
@@ -95,9 +122,7 @@ func TestTransferRepository_CreateGetAndIdempotencyKeyLookup(t *testing.T) {
 	assert.Nil(t, notFound)
 
 	require.NoError(t, repo.UpdateState(ctx, transfer.ID, domain.TransferProcessed))
-	updated, err := repo.Get(ctx, transfer.ID)
-	require.NoError(t, err)
-	assert.Equal(t, domain.TransferProcessed, updated.State)
+	assert.Equal(t, domain.TransferProcessed, transferState(t, pool, transfer.ID))
 }
 
 func TestTransferRepository_Create_DuplicateIdempotencyKey(t *testing.T) {
@@ -131,7 +156,6 @@ func TestTransferExecutor_Execute_Success(t *testing.T) {
 	fromID, toID := seedWallets(t, pool, 1000, 500)
 	transfers := postgres.NewTransferRepository(pool)
 	wallets := postgres.NewWalletRepository(pool)
-	ledger := postgres.NewLedgerRepository(pool)
 	executor := postgres.NewTransferExecutor(pool)
 	ctx := context.Background()
 
@@ -151,14 +175,45 @@ func TestTransferExecutor_Execute_Success(t *testing.T) {
 	require.NoError(t, err)
 	assert.EqualValues(t, 600, toWallet.Balance)
 
-	entries, err := ledger.ListForWallet(ctx, fromID)
-	require.NoError(t, err)
+	entries := ledgerEntriesFor(t, pool, fromID)
 	require.Len(t, entries, 1)
 	assert.Equal(t, domain.LedgerDebit, entries[0].Type)
 
-	updated, err := transfers.Get(ctx, transfer.ID)
-	require.NoError(t, err)
-	assert.Equal(t, domain.TransferProcessed, updated.State)
+	assert.Equal(t, domain.TransferProcessed, transferState(t, pool, transfer.ID))
+}
+
+// Dedicated ledger-correctness test: a transfer must produce exactly one
+// DEBIT and one CREDIT row, both referencing the same transfer, with
+// matching amounts — the double-entry invariant, checked as its own
+// behavioral claim rather than a side assertion of Execute_Success.
+func TestTransferExecutor_Execute_LedgerIsBalanced(t *testing.T) {
+	pool := testPool(t)
+	fromID, toID := seedWallets(t, pool, 1000, 500)
+	transfers := postgres.NewTransferRepository(pool)
+	executor := postgres.NewTransferExecutor(pool)
+	ctx := context.Background()
+
+	transfer := newPendingTransfer(fromID, toID, 100)
+	require.NoError(t, transfers.Create(ctx, transfer))
+
+	debit := domain.LedgerEntry{ID: uuid.NewString(), WalletID: fromID, TransferID: transfer.ID, Type: domain.LedgerDebit, Amount: 100, CreatedAt: time.Now()}
+	credit := domain.LedgerEntry{ID: uuid.NewString(), WalletID: toID, TransferID: transfer.ID, Type: domain.LedgerCredit, Amount: 100, CreatedAt: time.Now()}
+	require.NoError(t, executor.Execute(ctx, transfer, debit, credit))
+
+	debitEntries := ledgerEntriesFor(t, pool, fromID)
+	require.Len(t, debitEntries, 1, "exactly one ledger row for the debited wallet")
+	assert.Equal(t, domain.LedgerDebit, debitEntries[0].Type)
+	assert.Equal(t, transfer.ID, debitEntries[0].TransferID)
+
+	creditEntries := ledgerEntriesFor(t, pool, toID)
+	require.Len(t, creditEntries, 1, "exactly one ledger row for the credited wallet")
+	assert.Equal(t, domain.LedgerCredit, creditEntries[0].Type)
+	assert.Equal(t, transfer.ID, creditEntries[0].TransferID)
+
+	// The double-entry invariant: both legs reference the same transfer
+	// and carry the same amount, so debits and credits always balance.
+	assert.Equal(t, debitEntries[0].Amount, creditEntries[0].Amount,
+		"debit and credit amounts must match — the ledger must always balance")
 }
 
 func TestTransferExecutor_Execute_InsufficientFunds(t *testing.T) {
@@ -166,7 +221,6 @@ func TestTransferExecutor_Execute_InsufficientFunds(t *testing.T) {
 	fromID, toID := seedWallets(t, pool, 10, 0)
 	transfers := postgres.NewTransferRepository(pool)
 	wallets := postgres.NewWalletRepository(pool)
-	ledger := postgres.NewLedgerRepository(pool)
 	executor := postgres.NewTransferExecutor(pool)
 	ctx := context.Background()
 
@@ -183,13 +237,8 @@ func TestTransferExecutor_Execute_InsufficientFunds(t *testing.T) {
 	require.NoError(t, err)
 	assert.EqualValues(t, 10, fromWallet.Balance, "balance must be untouched on a failed debit")
 
-	entries, err := ledger.ListForWallet(ctx, fromID)
-	require.NoError(t, err)
-	assert.Empty(t, entries, "no ledger rows should be written on a failed debit")
-
-	unchanged, err := transfers.Get(ctx, transfer.ID)
-	require.NoError(t, err)
-	assert.Equal(t, domain.TransferPending, unchanged.State)
+	assert.Empty(t, ledgerEntriesFor(t, pool, fromID), "no ledger rows should be written on a failed debit")
+	assert.Equal(t, domain.TransferPending, transferState(t, pool, transfer.ID))
 }
 
 // Proves the concurrency claim: fires many concurrent debits at one wallet and checks the final balance.
@@ -294,4 +343,187 @@ func TestTransferExecutor_Execute_OppositeDirectionDeadlock(t *testing.T) {
 
 	assert.EqualValues(t, startingBalance, balA.Balance)
 	assert.EqualValues(t, startingBalance, balB.Balance)
+}
+
+// Proves the state-transition CAS added to Execute: a second call against
+// an already-PROCESSED transfer must fail, not silently re-apply the
+// debit/credit a second time.
+func TestTransferExecutor_Execute_RejectsDoubleExecution(t *testing.T) {
+	pool := testPool(t)
+	fromID, toID := seedWallets(t, pool, 1000, 500)
+	transfers := postgres.NewTransferRepository(pool)
+	wallets := postgres.NewWalletRepository(pool)
+	executor := postgres.NewTransferExecutor(pool)
+	ctx := context.Background()
+
+	transfer := newPendingTransfer(fromID, toID, 100)
+	require.NoError(t, transfers.Create(ctx, transfer))
+
+	debit := domain.LedgerEntry{ID: uuid.NewString(), WalletID: fromID, TransferID: transfer.ID, Type: domain.LedgerDebit, Amount: 100, CreatedAt: time.Now()}
+	credit := domain.LedgerEntry{ID: uuid.NewString(), WalletID: toID, TransferID: transfer.ID, Type: domain.LedgerCredit, Amount: 100, CreatedAt: time.Now()}
+
+	require.NoError(t, executor.Execute(ctx, transfer, debit, credit))
+
+	// Same transfer, same debit/credit — as if Execute got called twice
+	// for the same PROCESSED transfer (a bug, or a naive retry).
+	secondDebit := domain.LedgerEntry{ID: uuid.NewString(), WalletID: fromID, TransferID: transfer.ID, Type: domain.LedgerDebit, Amount: 100, CreatedAt: time.Now()}
+	secondCredit := domain.LedgerEntry{ID: uuid.NewString(), WalletID: toID, TransferID: transfer.ID, Type: domain.LedgerCredit, Amount: 100, CreatedAt: time.Now()}
+	err := executor.Execute(ctx, transfer, secondDebit, secondCredit)
+	assert.ErrorIs(t, err, domain.ErrInvalidStateTransition)
+
+	fromWallet, err := wallets.Get(ctx, fromID)
+	require.NoError(t, err)
+	assert.EqualValues(t, 900, fromWallet.Balance, "second Execute must not re-apply the debit")
+
+	toWallet, err := wallets.Get(ctx, toID)
+	require.NoError(t, err)
+	assert.EqualValues(t, 600, toWallet.Balance, "second Execute must not re-apply the credit")
+}
+
+// Proves the amount-agreement guard: Execute must reject debit/credit
+// entries whose amount doesn't match transfer.Amount, before writing
+// anything — a caller bug shouldn't be able to write a ledger entry that
+// doesn't match what was actually moved.
+func TestTransferExecutor_Execute_RejectsMismatchedLedgerAmounts(t *testing.T) {
+	pool := testPool(t)
+	fromID, toID := seedWallets(t, pool, 1000, 500)
+	transfers := postgres.NewTransferRepository(pool)
+	wallets := postgres.NewWalletRepository(pool)
+	executor := postgres.NewTransferExecutor(pool)
+	ctx := context.Background()
+
+	transfer := newPendingTransfer(fromID, toID, 100)
+	require.NoError(t, transfers.Create(ctx, transfer))
+
+	// credit.Amount doesn't match transfer.Amount.
+	debit := domain.LedgerEntry{ID: uuid.NewString(), WalletID: fromID, TransferID: transfer.ID, Type: domain.LedgerDebit, Amount: 100, CreatedAt: time.Now()}
+	credit := domain.LedgerEntry{ID: uuid.NewString(), WalletID: toID, TransferID: transfer.ID, Type: domain.LedgerCredit, Amount: 999, CreatedAt: time.Now()}
+
+	err := executor.Execute(ctx, transfer, debit, credit)
+	require.Error(t, err)
+	assert.NotErrorIs(t, err, domain.ErrInsufficientFunds, "should be rejected by the amount guard, not reach the debit statement")
+
+	fromWallet, err := wallets.Get(ctx, fromID)
+	require.NoError(t, err)
+	assert.EqualValues(t, 1000, fromWallet.Balance, "nothing should be written when the amounts disagree")
+
+	toWallet, err := wallets.Get(ctx, toID)
+	require.NoError(t, err)
+	assert.EqualValues(t, 500, toWallet.Balance)
+
+	assert.Empty(t, ledgerEntriesFor(t, pool, fromID))
+	assert.Equal(t, domain.TransferPending, transferState(t, pool, transfer.ID))
+}
+
+// Boundary case: a transfer for exactly the source wallet's whole balance
+// must succeed (the debit's WHERE balance >= $amount is inclusive), leaving
+// it at exactly zero — not rejected as insufficient funds by an off-by-one.
+func TestTransferExecutor_Execute_ExactBalance(t *testing.T) {
+	pool := testPool(t)
+	fromID, toID := seedWallets(t, pool, 100, 0)
+	transfers := postgres.NewTransferRepository(pool)
+	wallets := postgres.NewWalletRepository(pool)
+	executor := postgres.NewTransferExecutor(pool)
+	ctx := context.Background()
+
+	transfer := newPendingTransfer(fromID, toID, 100)
+	require.NoError(t, transfers.Create(ctx, transfer))
+
+	debit := domain.LedgerEntry{ID: uuid.NewString(), WalletID: fromID, TransferID: transfer.ID, Type: domain.LedgerDebit, Amount: 100, CreatedAt: time.Now()}
+	credit := domain.LedgerEntry{ID: uuid.NewString(), WalletID: toID, TransferID: transfer.ID, Type: domain.LedgerCredit, Amount: 100, CreatedAt: time.Now()}
+
+	require.NoError(t, executor.Execute(ctx, transfer, debit, credit))
+
+	fromWallet, err := wallets.Get(ctx, fromID)
+	require.NoError(t, err)
+	assert.EqualValues(t, 0, fromWallet.Balance)
+}
+
+// Extends the two-wallet deadlock fix to a three-wallet cycle (A->B->C->A
+// concurrently, repeatedly). Per the standard resource-ordering
+// deadlock-prevention argument, locking in a single global order (here,
+// ascending wallet id) per transaction prevents cycles of any size, not
+// just two — this is a stress test for that claim, not expected to ever
+// fail if the two-wallet fix is correct.
+func TestTransferExecutor_Execute_ThreeWayCircularConcurrent(t *testing.T) {
+	pool := testPool(t)
+	const (
+		startingBalance = 5000
+		perTransfer     = 10
+		perLeg          = 20
+	)
+	ctx := context.Background()
+	walletA, walletB := seedWallets(t, pool, startingBalance, startingBalance)
+	walletC, _ := seedWallets(t, pool, startingBalance, 0) // second ID unused, cleaned up regardless
+
+	transfers := postgres.NewTransferRepository(pool)
+	wallets := postgres.NewWalletRepository(pool)
+	executor := postgres.NewTransferExecutor(pool)
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+
+	fire := func(from, to string) {
+		defer wg.Done()
+		transfer := newPendingTransfer(from, to, perTransfer)
+		if err := transfers.Create(ctx, transfer); err != nil {
+			t.Errorf("transfers.Create: %v", err)
+			return
+		}
+		debit := domain.LedgerEntry{ID: uuid.NewString(), WalletID: from, TransferID: transfer.ID, Type: domain.LedgerDebit, Amount: perTransfer, CreatedAt: time.Now()}
+		credit := domain.LedgerEntry{ID: uuid.NewString(), WalletID: to, TransferID: transfer.ID, Type: domain.LedgerCredit, Amount: perTransfer, CreatedAt: time.Now()}
+
+		<-start
+		if err := executor.Execute(ctx, transfer, debit, credit); err != nil {
+			t.Errorf("executor.Execute (from=%s to=%s): %v", from, to, err)
+		}
+	}
+
+	for i := 0; i < perLeg; i++ {
+		wg.Add(3)
+		go fire(walletA, walletB)
+		go fire(walletB, walletC)
+		go fire(walletC, walletA)
+	}
+	close(start)
+	wg.Wait()
+
+	// Every wallet sends perLeg*perTransfer and receives perLeg*perTransfer,
+	// so each nets to its starting balance.
+	for _, id := range []string{walletA, walletB, walletC} {
+		w, err := wallets.Get(ctx, id)
+		require.NoError(t, err)
+		assert.EqualValues(t, startingBalance, w.Balance, "wallet %s", id)
+	}
+}
+
+// Execute must fail promptly (not hang) when given an already-canceled
+// context, and must leave the pool in a usable state afterward — proving
+// the Rollback(context.WithoutCancel(ctx)) actually reaches Postgres
+// instead of no-op'ing on the canceled context and leaking the
+// transaction/connection.
+func TestTransferExecutor_Execute_CanceledContextRollsBackCleanly(t *testing.T) {
+	pool := testPool(t)
+	fromID, toID := seedWallets(t, pool, 1000, 500)
+	transfers := postgres.NewTransferRepository(pool)
+	wallets := postgres.NewWalletRepository(pool)
+	executor := postgres.NewTransferExecutor(pool)
+
+	transfer := newPendingTransfer(fromID, toID, 100)
+	require.NoError(t, transfers.Create(context.Background(), transfer))
+
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	debit := domain.LedgerEntry{ID: uuid.NewString(), WalletID: fromID, TransferID: transfer.ID, Type: domain.LedgerDebit, Amount: 100, CreatedAt: time.Now()}
+	credit := domain.LedgerEntry{ID: uuid.NewString(), WalletID: toID, TransferID: transfer.ID, Type: domain.LedgerCredit, Amount: 100, CreatedAt: time.Now()}
+
+	err := executor.Execute(canceledCtx, transfer, debit, credit)
+	require.Error(t, err, "Execute must not succeed against an already-canceled context")
+
+	// The pool must still work afterward — no stuck transaction or
+	// connection left behind by the canceled rollback.
+	fromWallet, err := wallets.Get(context.Background(), fromID)
+	require.NoError(t, err)
+	assert.EqualValues(t, 1000, fromWallet.Balance, "canceled Execute must not have partially applied")
 }

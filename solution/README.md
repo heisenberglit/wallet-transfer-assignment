@@ -13,7 +13,6 @@ internal/service/         business logic: validation, idempotency, orchestration
 internal/repository/      persistence interfaces (postgres/ implements them)
 internal/domain/          entities, state machine, sentinel errors
 internal/db/              Postgres connection pool
-internal/utils/           small cross-cutting helpers (Postgres error-code checks)
 migrations/               SQL schema
 scripts/seed.sql          wallet seed data for manual testing (make seed)
 ```
@@ -25,6 +24,13 @@ The service depends on repository *interfaces*
 (`internal/repository/interfaces.go`), not the concrete Postgres types,
 so it's testable without a database (see `transfer_service_test.go`'s
 hand-rolled fakes).
+
+Those interfaces are deliberately **consumer-shaped**: they list only the
+methods `TransferService` actually calls, so nothing exists to satisfy a
+layer diagram. Postgres-specific helpers (SQLSTATE checks) live in
+`repository/postgres` beside their only caller rather than in a general
+`utils` package — that package was removed once it became clear it would
+only ever hold two functions used from one file.
 
 ### The transfer write path
 
@@ -120,11 +126,18 @@ Response (201, both on the first call and on a replayed duplicate):
 | Case                                   | Status |
 |-----------------------------------------|--------|
 | Success                                 | 201    |
-| Replayed duplicate (same `idempotencyKey`) | 201, identical body to the original |
+| Replayed duplicate of a *processed* transfer | 201, identical body to the original |
+| Replayed duplicate of a *failed* transfer | 422, identical to the original response |
 | `amount <= 0` / self-transfer            | 422    |
 | Insufficient funds                       | 422    |
 | Unknown wallet                           | 404    |
 | Malformed JSON body                      | 400    |
+
+A replay reproduces the **original outcome, error included**. An earlier
+version returned `201 {"state":"FAILED"}` when a failed transfer's key was
+retried, which told a retrying client the money had moved when it never
+had; `replay()` in `transfer_service.go` now re-raises the original error,
+pinned by tests at both the service and handler layers.
 
 There is currently no endpoint to create a wallet or read a balance —
 see Known Limitations below.
@@ -165,18 +178,24 @@ go test ./...                    # unit tests only; Postgres tests self-skip
 
 Two kinds of tests:
 
-- **Unit tests** (`internal/service/transfer_service_test.go`) — no
-  database, using hand-rolled fakes for the repository/executor
-  interfaces. Cover validation, the idempotency-replay path, the
+- **Unit tests** — no database, using hand-rolled fakes.
+  `internal/service/transfer_service_test.go` covers validation, both
+  idempotency-replay paths (including replay of a *failed* transfer), the
   same-key race, insufficient funds, and the success path.
-- **Integration tests** (`internal/repository/postgres/integration_test.go`)
-  — need a real Postgres with the migration applied; they skip
-  themselves (not fail) if `DATABASE_URL` isn't set. Cover repository
-  CRUD, `TransferExecutor.Execute` (success and insufficient funds), and
-  a concurrency test that fires many simultaneous debits at the same
-  wallet and asserts the final balance is exactly right — this is the
-  test that actually proves the concurrency-safety claim, not just
-  compiles it:
+  `internal/handler/http/transfer_handler_test.go` covers the transport
+  contract: every error→status mapping, that a failed transfer is never
+  reported as a 201, that internal error details aren't leaked to the
+  client, and that malformed requests never reach the service.
+- **Integration tests** (`internal/repository/postgres/integration_test.go`,
+  `internal/service/integration_test.go`) — need a real Postgres with the
+  migration applied; they skip themselves (not fail) if `DATABASE_URL`
+  isn't set. Cover repository CRUD, ledger balancing, the executor's
+  success/insufficient-funds/double-execution/amount-guard/cancelled-context
+  paths, and four concurrency tests — simultaneous debits on one wallet,
+  opposite-direction transfers (the deadlock regression), a three-way
+  circular cycle, and 20 concurrent `CreateTransfer` calls sharing one
+  idempotency key. These are what actually prove the concurrency-safety
+  claim rather than just compiling it:
 
 ```bash
 docker compose up -d
@@ -249,12 +268,37 @@ only at `internal/service` wouldn't find it there.
 in one function.
 ✅ Matches how ledger-writing systems often prefer explicit,
 one-operation-per-function code for auditability.
-❌ Doesn't reuse `WalletRepository`/`LedgerRepository`'s own methods (it
-duplicates a few lines of SQL instead) — the trade-off point is
-documented in `transfer_executor.go`'s comment.
+❌ Doesn't reuse the wallet repository's own methods (it duplicates a few
+lines of SQL instead) — the trade-off point is documented in
+`transfer_executor.go`'s comment. There is consequently no ledger
+repository at all: `TransferExecutor` is the only thing that touches
+`ledger_entries`, and the integration tests read those rows with direct
+SQL rather than through persistence code that would exist only for them.
 ❌ If a second multi-table atomic operation shows up (a refund, say),
 this pattern doesn't extend cleanly — that's the point at which a shared
 transaction helper would earn its cost.
+
+**Mixed id column types: `UUID` for server-generated ids, `TEXT` for
+caller-supplied ones.**
+`transfers.id`, `ledger_entries.id` and `ledger_entries.transfer_id` are
+`UUID`; `wallets.id` and `idempotency_key` are `TEXT`.
+✅ The service is the only writer of the first group — they always come
+from `uuid.NewString()` — so the column can be the narrow type: 16 bytes
+instead of 36-plus-header, paid again in the primary key, the
+`idx_ledger_entries_transfer_id` index, and the foreign key. `ledger_entries`
+is the table that grows without bound, so that is where it compounds.
+✅ The database rejects a malformed id outright (`SQLSTATE 22P02`) rather
+than storing it — correctness enforced by the schema, not by convention.
+✅ `TEXT` is still right for the other two: wallet ids are supplied by the
+caller and are not UUIDs (`wallet_1` in the brief), and `idempotency_key`
+is an arbitrary client-chosen string.
+❌ The schema is no longer uniform — two id types means a reader has to
+know which is which, and it forecloses the SQLite fallback the assignment
+lists as acceptable, since SQLite has no `UUID` type.
+❌ No Go-side change was needed (pgx encodes a Go `string` into a `uuid`
+parameter and scans it back), so the type discipline lives only in the
+database — `domain.Transfer.ID` is still a `string` and would accept
+anything if some future code path set it by hand.
 
 **Idempotency via a `UNIQUE` constraint on `transfers.idempotency_key`,
 not a separate `idempotency_records` table.**
@@ -280,8 +324,6 @@ reconciles them against each other.
 - **A crash between creating the `PENDING` row and `Execute` running
   leaves that transfer stuck in `PENDING` forever**, with no
   reconciliation job to find and resolve it.
-- **No automated tests for the HTTP handler layer** (`TransferHandler`)
-  — only the service and repository layers are covered.
 - **No wallet-creation or balance-read API** — wallets only exist via
   `scripts/seed.sql` (`make seed`). Listed as optional in the assignment,
   but worth calling out since there's no way to create an arbitrary
@@ -290,6 +332,18 @@ reconciles them against each other.
   just `{"error": "insufficient funds"}` with 422, even though the
   `FAILED` transfer row does exist. Revisit if a client needs to look up
   a failed attempt later.
+- **`FAILED` is terminal for a given idempotency key.** Once a key's
+  transfer fails, every retry of that key replays the 422 — even after the
+  wallet is funded. That's the correct reading of exactly-once ("return
+  the original result"), but it does mean a client retrying after topping
+  up must use a *new* key. Worth stating explicitly in a client-facing
+  API doc.
+- **A malformed transfer id would surface as a 500, not a 404.** Now that
+  `transfers.id` is `UUID`, querying it with a non-UUID string raises
+  `SQLSTATE 22P02` rather than returning no rows. Nothing is exposed today
+  — no endpoint accepts a transfer id — but whoever adds
+  `GET /transfers/{id}` needs to map that code to a 400/404 instead of
+  letting it fall through to the generic internal-error branch.
 - **No DB-level unique constraint on `ledger_entries (transfer_id, wallet_id)`.**
   The application-level guards (the transfer-state CAS in
   `TransferExecutor.Execute`, plus the fact that nothing currently calls

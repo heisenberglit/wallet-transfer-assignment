@@ -1,7 +1,3 @@
--- Initial schema for the wallet transfer service.
--- TODO: review constraints/indexes as the concurrency and idempotency
--- strategy is finalized (see docs/design.md).
-
 CREATE TABLE wallets (
     id          TEXT PRIMARY KEY,
     balance     BIGINT NOT NULL DEFAULT 0 CHECK (balance >= 0),
@@ -10,7 +6,7 @@ CREATE TABLE wallets (
 );
 
 CREATE TABLE transfers (
-    id               TEXT PRIMARY KEY,
+    id               UUID PRIMARY KEY,
     idempotency_key  TEXT NOT NULL UNIQUE,
     from_wallet_id   TEXT NOT NULL REFERENCES wallets (id),
     to_wallet_id     TEXT NOT NULL REFERENCES wallets (id),
@@ -22,9 +18,9 @@ CREATE TABLE transfers (
 );
 
 CREATE TABLE ledger_entries (
-    id           TEXT PRIMARY KEY,
+    id           UUID PRIMARY KEY,
     wallet_id    TEXT NOT NULL REFERENCES wallets (id),
-    transfer_id  TEXT NOT NULL REFERENCES transfers (id),
+    transfer_id  UUID NOT NULL REFERENCES transfers (id),
     type         TEXT NOT NULL CHECK (type IN ('DEBIT', 'CREDIT')),
     amount       BIGINT NOT NULL CHECK (amount > 0),
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now()

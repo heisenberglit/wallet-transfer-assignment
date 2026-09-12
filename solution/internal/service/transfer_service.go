@@ -20,8 +20,6 @@ type CreateTransferInput struct {
 	Amount         int64
 }
 
-// TransferService owns the transfer workflow: validation, idempotency,
-// and delegating the atomic debit/credit/ledger write to executor.
 type TransferService struct {
 	wallets   repository.WalletRepository
 	transfers repository.TransferRepository
@@ -40,8 +38,6 @@ func NewTransferService(
 	}
 }
 
-// CreateTransfer executes a wallet-to-wallet transfer, guaranteeing
-// exactly-once semantics for a given IdempotencyKey.
 func (s *TransferService) CreateTransfer(ctx context.Context, in CreateTransferInput) (*domain.Transfer, error) {
 	if in.Amount <= 0 {
 		return nil, domain.ErrInvalidAmount
@@ -60,8 +56,9 @@ func (s *TransferService) CreateTransfer(ctx context.Context, in CreateTransferI
 	if existing, err := s.transfers.GetByIdempotencyKey(ctx, in.IdempotencyKey); err != nil {
 		return nil, err
 	} else if existing != nil {
-		slog.Info("transfer idempotency replay", "transfer_id", existing.ID, "idempotency_key", in.IdempotencyKey)
-		return existing, nil
+		slog.Info("transfer idempotency replay", "transfer_id", existing.ID,
+			"idempotency_key", in.IdempotencyKey, "state", existing.State)
+		return replay(existing)
 	}
 
 	now := time.Now()
@@ -78,15 +75,14 @@ func (s *TransferService) CreateTransfer(ctx context.Context, in CreateTransferI
 
 	if err := s.transfers.Create(ctx, transfer); err != nil {
 		if errors.Is(err, domain.ErrIdempotencyConflict) {
-			// Lost the race: return the winner's transfer instead of erroring.
 			existing, getErr := s.transfers.GetByIdempotencyKey(ctx, in.IdempotencyKey)
 			if getErr != nil {
 				return nil, getErr
 			}
 			if existing != nil {
 				slog.Info("transfer idempotency race lost, returning winner",
-					"transfer_id", existing.ID, "idempotency_key", in.IdempotencyKey)
-				return existing, nil
+					"transfer_id", existing.ID, "idempotency_key", in.IdempotencyKey, "state", existing.State)
+				return replay(existing)
 			}
 		}
 		slog.Error("transfer create failed", "idempotency_key", in.IdempotencyKey, "error", err)
@@ -116,4 +112,13 @@ func (s *TransferService) CreateTransfer(ctx context.Context, in CreateTransferI
 	slog.Info("transfer processed", "transfer_id", transfer.ID, "idempotency_key", in.IdempotencyKey)
 	transfer.State = domain.TransferProcessed
 	return transfer, nil
+}
+
+// replay reproduces the original outcome for an already-seen idempotency key,
+// error included — a retry of a failed transfer must not look like a success.
+func replay(existing *domain.Transfer) (*domain.Transfer, error) {
+	if existing.State == domain.TransferFailed {
+		return existing, domain.ErrInsufficientFunds
+	}
+	return existing, nil
 }

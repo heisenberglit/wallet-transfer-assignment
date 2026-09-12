@@ -1,5 +1,4 @@
-// Package utils holds small cross-cutting helpers — kept narrow, not a catch-all.
-package utils
+package postgres
 
 import (
 	"errors"
@@ -13,14 +12,12 @@ const (
 	pgForeignKeyViolation = "23503"
 )
 
-// IsUniqueViolation reports whether err is a Postgres unique-constraint violation.
-func IsUniqueViolation(err error) bool {
+func isUniqueViolation(err error) bool {
 	var pgErr *pgconn.PgError
 	return errors.As(err, &pgErr) && pgErr.Code == pgUniqueViolation
 }
 
-// IsForeignKeyViolation reports whether err is a Postgres foreign-key violation.
-func IsForeignKeyViolation(err error) bool {
+func isForeignKeyViolation(err error) bool {
 	var pgErr *pgconn.PgError
 	return errors.As(err, &pgErr) && pgErr.Code == pgForeignKeyViolation
 }

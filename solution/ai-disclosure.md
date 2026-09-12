@@ -68,7 +68,7 @@ is omitted or reworded from what was actually typed.
 - "Remove anything unnecessary and move pgerr.go to utils and
   also add observability wherever needed and unit and integration test cases. Also add
   README.md for this which contains details of endpoints and how to
-  build and run and deploy and architecure and pros and cons etc."
+  build, run and deploy and add architecure diagram and known limitations."
 
 **8. Seed script**
 

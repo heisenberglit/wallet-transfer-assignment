@@ -11,14 +11,12 @@ const (
 	TransferFailed    TransferState = "FAILED"
 )
 
-// Transfer represents a single wallet-to-wallet transfer request.
-// IdempotencyKey is unique at the DB level (see migrations/).
 type Transfer struct {
 	ID             string
 	IdempotencyKey string
 	FromWalletID   string
 	ToWalletID     string
-	Amount         int64
+	Amount         int64 // minor units (e.g. cents), always positive
 	State          TransferState
 	CreatedAt      time.Time
 	UpdatedAt      time.Time
